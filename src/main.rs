@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::prelude::*;
+use ed25519_dalek::{Signer, SigningKey};
 use futures::StreamExt;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 // --- Config ---
 
@@ -14,27 +19,51 @@ struct Config {
     base_url: String,
     token: String,
     space_id: String,
+    token_file: Option<PathBuf>,
 }
 
 impl Config {
     fn from_env() -> Result<Self, String> {
+        let token_file = std::env::var("NUBI_TOKEN_FILE").ok().map(PathBuf::from);
+        let token = if let Some(ref path) = token_file {
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read token file: {}", e))?
+                .trim()
+                .to_string()
+        } else {
+            std::env::var("NUBI_TOKEN").map_err(|_| "NUBI_TOKEN or NUBI_TOKEN_FILE required")?
+        };
+
         Ok(Self {
             base_url: std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
-            token: std::env::var("NUBI_TOKEN").map_err(|_| "NUBI_TOKEN required")?,
+            token,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
+            token_file,
         })
+    }
+
+    fn reload_token(&mut self) -> Result<(), String> {
+        if let Some(ref path) = self.token_file {
+            self.token = std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read token file: {}", e))?
+                .trim()
+                .to_string();
+            Ok(())
+        } else {
+            Err("no token file configured (set NUBI_TOKEN_FILE to enable reload)".into())
+        }
     }
 }
 
 // --- Nubi Client ---
 
 struct NubiClient {
-    config: Config,
+    config: Arc<RwLock<Config>>,
     http: reqwest::Client,
 }
 
 impl NubiClient {
-    fn new(config: Config) -> Self {
+    fn new(config: Arc<RwLock<Config>>) -> Self {
         Self {
             config,
             http: reqwest::Client::new(),
@@ -42,9 +71,10 @@ impl NubiClient {
     }
 
     async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
-        let url = format!("{}{}", self.config.base_url, path);
+        let config = self.config.read().await;
+        let url = format!("{}{}", config.base_url, path);
         let mut req = self.http.request(method, &url)
-            .header("Authorization", format!("Bearer {}", self.config.token))
+            .header("Authorization", format!("Bearer {}", config.token))
             .header("Content-Type", "application/json");
 
         if let Some(b) = body {
@@ -62,28 +92,32 @@ impl NubiClient {
         res.json().await.map_err(|e| e.to_string())
     }
 
+    async fn space_id(&self) -> String {
+        self.config.read().await.space_id.clone()
+    }
+
     async fn list_rooms(&self) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms", self.config.space_id);
+        let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         self.request(reqwest::Method::GET, &path, None).await
     }
 
     async fn get_room(&self, room_id: &str) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms/{}", self.config.space_id, room_id);
+        let path = format!("/v1/spaces/{}/rooms/{}", self.space_id().await, room_id);
         self.request(reqwest::Method::GET, &path, None).await
     }
 
     async fn create_room(&self, name: &str) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms", self.config.space_id);
+        let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         self.request(reqwest::Method::POST, &path, Some(json!({ "name": name }))).await
     }
 
     async fn get_or_create_dm(&self, with_agent: &str) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/dms", self.config.space_id);
+        let path = format!("/v1/spaces/{}/dms", self.space_id().await);
         self.request(reqwest::Method::POST, &path, Some(json!({ "with": with_agent }))).await
     }
 
     async fn send_message(&self, room_id: &str, text: &str, mentions: Vec<String>) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms/{}/messages", self.config.space_id, room_id);
+        let path = format!("/v1/spaces/{}/rooms/{}/messages", self.space_id().await, room_id);
         let message_id = uuid::Uuid::new_v4().to_string();
         self.request(reqwest::Method::POST, &path, Some(json!({
             "message_id": message_id,
@@ -93,7 +127,7 @@ impl NubiClient {
     }
 
     async fn poll(&self, room_id: &str, from_index: Option<u64>, max_tokens: Option<u32>, mentioned_only: bool, wait_ms: Option<u64>) -> Result<Value, String> {
-        let mut path = format!("/v1/spaces/{}/rooms/{}/messages", self.config.space_id, room_id);
+        let mut path = format!("/v1/spaces/{}/rooms/{}/messages", self.space_id().await, room_id);
         let mut params = vec![];
         if let Some(idx) = from_index { params.push(format!("from_index={}", idx)); }
         if let Some(t) = max_tokens { params.push(format!("max_tokens={}", t)); }
@@ -105,23 +139,53 @@ impl NubiClient {
 
     async fn search(&self, room_id: &str, query: &str, from_index: Option<u64>) -> Result<Value, String> {
         let encoded_query = urlencoding(query);
-        let mut path = format!("/v1/spaces/{}/rooms/{}/search?q={}", self.config.space_id, room_id, encoded_query);
+        let mut path = format!("/v1/spaces/{}/rooms/{}/search?q={}", self.space_id().await, room_id, encoded_query);
         if let Some(idx) = from_index { path = format!("{}&from_index={}", path, idx); }
         self.request(reqwest::Method::GET, &path, None).await
     }
 
     async fn list_agents(&self) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/agents", self.config.space_id);
+        let path = format!("/v1/spaces/{}/agents", self.space_id().await);
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    fn stream_url(&self, room_id: &str, mentioned_only: bool) -> String {
-        let mut url = format!("{}/v1/spaces/{}/rooms/{}/stream",
-            self.config.base_url, self.config.space_id, room_id);
-        if mentioned_only {
-            url.push_str("?mentioned_only=true");
+    async fn invite_member(&self, room_id: &str, agent_id: &str, role: &str) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/rooms/{}/invite", self.space_id().await, room_id);
+        self.request(reqwest::Method::POST, &path, Some(json!({
+            "agent_id": agent_id,
+            "role": role
+        }))).await
+    }
+
+    async fn self_register(&self, agent_id: &str, name: &str, public_key: &str, signature: &str, timestamp_ms: u64) -> Result<Value, String> {
+        let config = self.config.read().await;
+        let url = format!("{}/v1/spaces/{}/register", config.base_url, config.space_id);
+        drop(config);
+        let res = self.http.post(&url)
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "agent_id": agent_id,
+                "name": name,
+                "public_key": public_key,
+                "signature": signature,
+                "timestamp_ms": timestamp_ms
+            }))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("HTTP {}: {}", status, text));
         }
-        url
+
+        res.json().await.map_err(|e| e.to_string())
+    }
+
+    async fn reload_token(&self) -> Result<(), String> {
+        let mut config = self.config.write().await;
+        config.reload_token()
     }
 }
 
@@ -343,6 +407,42 @@ fn tools_list() -> Value {
                     "properties": { "room_id": { "type": "string" } },
                     "required": ["room_id"]
                 }
+            },
+            {
+                "name": "nubi_invite",
+                "description": "Invite an agent to a room",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string" },
+                        "agent_id": { "type": "string" },
+                        "role": { "type": "string", "enum": ["member", "admin", "readonly"], "default": "member" }
+                    },
+                    "required": ["room_id", "agent_id"]
+                }
+            },
+            {
+                "name": "nubi_generate_keypair",
+                "description": "Generate an ed25519 keypair for self-registration. Returns public key and private key (keep private key secret!)",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "nubi_self_register",
+                "description": "Self-register as a new agent using a keypair. Proves identity by signing with private key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "Your desired agent ID" },
+                        "name": { "type": "string", "description": "Display name" },
+                        "private_key": { "type": "string", "description": "Your private key from nubi_generate_keypair" }
+                    },
+                    "required": ["agent_id", "name", "private_key"]
+                }
+            },
+            {
+                "name": "nubi_reload",
+                "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
+                "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
@@ -352,7 +452,7 @@ async fn handle_tool_call(
     client: &NubiClient,
     name: &str,
     args: &Value,
-    config: &Config,
+    config: &Arc<RwLock<Config>>,
     subscriptions: &Subscriptions,
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Result<Value, String> {
@@ -394,6 +494,60 @@ async fn handle_tool_call(
             client.search(room_id, query, from_index).await
         }
         "nubi_list_agents" => client.list_agents().await,
+        "nubi_invite" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
+            let role = args["role"].as_str().unwrap_or("member");
+            client.invite_member(room_id, agent_id, role).await
+        }
+        "nubi_generate_keypair" => {
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+
+            let private_key = BASE64_STANDARD.encode(signing_key.to_bytes());
+            let public_key = format!("ed25519:{}", BASE64_STANDARD.encode(verifying_key.as_bytes()));
+
+            Ok(json!({
+                "public_key": public_key,
+                "private_key": private_key,
+                "warning": "Keep your private_key SECRET! Never share it. Use it with nubi_self_register to create your agent."
+            }))
+        }
+        "nubi_self_register" => {
+            let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
+            let name = args["name"].as_str().ok_or("name required")?;
+            let private_key_b64 = args["private_key"].as_str().ok_or("private_key required")?;
+
+            // Decode private key
+            let private_key_bytes = BASE64_STANDARD.decode(private_key_b64)
+                .map_err(|_| "invalid private_key base64")?;
+            let private_key_arr: [u8; 32] = private_key_bytes.try_into()
+                .map_err(|_| "private_key must be 32 bytes")?;
+            let signing_key = SigningKey::from_bytes(&private_key_arr);
+            let verifying_key = signing_key.verifying_key();
+
+            // Get current timestamp
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis() as u64;
+
+            // Create message to sign: "{space_id}:{agent_id}:{timestamp_ms}"
+            let space_id = client.space_id().await;
+            let message = format!("{}:{}:{}", space_id, agent_id, timestamp_ms);
+            let signature = signing_key.sign(message.as_bytes());
+
+            // Format public key and signature
+            let public_key = format!("ed25519:{}", BASE64_STANDARD.encode(verifying_key.as_bytes()));
+            let signature_b64 = BASE64_STANDARD.encode(signature.to_bytes());
+
+            // Call self-register endpoint
+            client.self_register(agent_id, name, &public_key, &signature_b64, timestamp_ms).await
+        }
+        "nubi_reload" => {
+            client.reload_token().await?;
+            Ok(json!({ "status": "reloaded", "message": "Token reloaded from file" }))
+        }
         "nubi_subscribe" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?.to_string();
             let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
@@ -403,7 +557,7 @@ async fn handle_tool_call(
                 return Ok(json!({ "status": "already_subscribed", "room_id": room_id }));
             }
 
-            let cfg = config.clone();
+            let cfg = config.read().await.clone();
             let rid = room_id.clone();
             let tx = notify_tx.clone();
 
@@ -431,7 +585,7 @@ async fn handle_tool_call(
 async fn handle_request(
     client: &NubiClient,
     req: JsonRpcRequest,
-    config: &Config,
+    config: &Arc<RwLock<Config>>,
     subscriptions: &Subscriptions,
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Option<JsonRpcResponse> {
@@ -481,12 +635,13 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config error: {}", e);
-            eprintln!("Required: NUBI_TOKEN, NUBI_SPACE");
+            eprintln!("Required: NUBI_TOKEN or NUBI_TOKEN_FILE, NUBI_SPACE");
             eprintln!("Optional: NUBI_URL (default: http://127.0.0.1:8080)");
             std::process::exit(1);
         }
     };
 
+    let config = Arc::new(RwLock::new(config));
     let client = NubiClient::new(config.clone());
     let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Value>();
