@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::{mpsc, Mutex};
 
 // --- Config ---
 
@@ -10,7 +14,6 @@ struct Config {
     base_url: String,
     token: String,
     space_id: String,
-    agent_id: String,
 }
 
 impl Config {
@@ -19,7 +22,6 @@ impl Config {
             base_url: std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
             token: std::env::var("NUBI_TOKEN").map_err(|_| "NUBI_TOKEN required")?,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
-            agent_id: std::env::var("NUBI_AGENT").map_err(|_| "NUBI_AGENT required")?,
         })
     }
 }
@@ -102,7 +104,7 @@ impl NubiClient {
     }
 
     async fn search(&self, room_id: &str, query: &str, from_index: Option<u64>) -> Result<Value, String> {
-        let encoded_query = urlencoding(&query);
+        let encoded_query = urlencoding(query);
         let mut path = format!("/v1/spaces/{}/rooms/{}/search?q={}", self.config.space_id, room_id, encoded_query);
         if let Some(idx) = from_index { path = format!("{}&from_index={}", path, idx); }
         self.request(reqwest::Method::GET, &path, None).await
@@ -111,6 +113,15 @@ impl NubiClient {
     async fn list_agents(&self) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/agents", self.config.space_id);
         self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    fn stream_url(&self, room_id: &str, mentioned_only: bool) -> String {
+        let mut url = format!("{}/v1/spaces/{}/rooms/{}/stream",
+            self.config.base_url, self.config.space_id, room_id);
+        if mentioned_only {
+            url.push_str("?mentioned_only=true");
+        }
+        url
     }
 }
 
@@ -128,6 +139,79 @@ fn urlencoding(s: &str) -> String {
         }
     }
     result
+}
+
+// --- Subscription Manager ---
+
+type Subscriptions = Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>;
+
+async fn start_subscription(
+    config: Config,
+    room_id: String,
+    mentioned_only: bool,
+    notify_tx: mpsc::UnboundedSender<Value>,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/spaces/{}/rooms/{}/stream{}",
+        config.base_url, config.space_id, room_id,
+        if mentioned_only { "?mentioned_only=true" } else { "" });
+
+    let res = client.get(&url)
+        .header("Authorization", format!("Bearer {}", config.token))
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        return Err(format!("SSE connect failed: {}", res.status()));
+    }
+
+    let mut stream = res.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&text);
+
+        // Parse SSE events from buffer
+        while let Some(pos) = buffer.find("\n\n") {
+            let event_text = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+
+            // Parse event
+            let mut event_type = String::new();
+            let mut data = String::new();
+            let mut id = String::new();
+
+            for line in event_text.lines() {
+                if line.starts_with("event:") {
+                    event_type = line[6..].trim().to_string();
+                } else if line.starts_with("data:") {
+                    data = line[5..].trim().to_string();
+                } else if line.starts_with("id:") {
+                    id = line[3..].trim().to_string();
+                }
+            }
+
+            // Skip pings and empty events
+            if event_type == "entry" && !data.is_empty() {
+                let notification = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "room_id": room_id,
+                        "event_id": id,
+                        "entry": serde_json::from_str::<Value>(&data).unwrap_or(Value::Null)
+                    }
+                });
+                let _ = notify_tx.send(notification);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // --- MCP Protocol ---
@@ -238,12 +322,40 @@ fn tools_list() -> Value {
                 "name": "nubi_list_agents",
                 "description": "List all agents in the space",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "nubi_subscribe",
+                "description": "Subscribe to real-time messages in a room. Messages will be delivered as notifications.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string" },
+                        "mentioned_only": { "type": "boolean", "description": "Only receive messages that mention you" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_unsubscribe",
+                "description": "Unsubscribe from a room's real-time messages",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string" } },
+                    "required": ["room_id"]
+                }
             }
         ]
     })
 }
 
-async fn handle_tool_call(client: &NubiClient, name: &str, args: &Value) -> Result<Value, String> {
+async fn handle_tool_call(
+    client: &NubiClient,
+    name: &str,
+    args: &Value,
+    config: &Config,
+    subscriptions: &Subscriptions,
+    notify_tx: &mpsc::UnboundedSender<Value>,
+) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => client.list_rooms().await,
         "nubi_get_room" => {
@@ -282,11 +394,47 @@ async fn handle_tool_call(client: &NubiClient, name: &str, args: &Value) -> Resu
             client.search(room_id, query, from_index).await
         }
         "nubi_list_agents" => client.list_agents().await,
+        "nubi_subscribe" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?.to_string();
+            let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
+
+            let mut subs = subscriptions.lock().await;
+            if subs.contains_key(&room_id) {
+                return Ok(json!({ "status": "already_subscribed", "room_id": room_id }));
+            }
+
+            let cfg = config.clone();
+            let rid = room_id.clone();
+            let tx = notify_tx.clone();
+
+            let handle = tokio::spawn(async move {
+                let _ = start_subscription(cfg, rid, mentioned_only, tx).await;
+            });
+
+            subs.insert(room_id.clone(), handle);
+            Ok(json!({ "status": "subscribed", "room_id": room_id }))
+        }
+        "nubi_unsubscribe" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let mut subs = subscriptions.lock().await;
+            if let Some(handle) = subs.remove(room_id) {
+                handle.abort();
+                Ok(json!({ "status": "unsubscribed", "room_id": room_id }))
+            } else {
+                Ok(json!({ "status": "not_subscribed", "room_id": room_id }))
+            }
+        }
         _ => Err(format!("unknown tool: {}", name)),
     }
 }
 
-async fn handle_request(client: &NubiClient, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+async fn handle_request(
+    client: &NubiClient,
+    req: JsonRpcRequest,
+    config: &Config,
+    subscriptions: &Subscriptions,
+    notify_tx: &mpsc::UnboundedSender<Value>,
+) -> Option<JsonRpcResponse> {
     let result = match req.method.as_str() {
         "initialize" => Ok(json!({
             "protocolVersion": "2024-11-05",
@@ -298,7 +446,7 @@ async fn handle_request(client: &NubiClient, req: JsonRpcRequest) -> Option<Json
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
             let args = &req.params["arguments"];
-            match handle_tool_call(client, name, args).await {
+            match handle_tool_call(client, name, args, config, subscriptions, notify_tx).await {
                 Ok(v) => Ok(json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }]
                 })),
@@ -333,13 +481,27 @@ async fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config error: {}", e);
-            eprintln!("Required: NUBI_TOKEN, NUBI_SPACE, NUBI_AGENT");
+            eprintln!("Required: NUBI_TOKEN, NUBI_SPACE");
             eprintln!("Optional: NUBI_URL (default: http://127.0.0.1:8080)");
             std::process::exit(1);
         }
     };
 
-    let client = NubiClient::new(config);
+    let client = NubiClient::new(config.clone());
+    let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
+    let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Value>();
+
+    // Spawn task to write notifications to stdout
+    let stdout_handle = tokio::spawn(async move {
+        let mut stdout = io::stdout();
+        while let Some(notification) = notify_rx.recv().await {
+            let out = serde_json::to_string(&notification).unwrap();
+            let _ = writeln!(stdout, "{}", out);
+            let _ = stdout.flush();
+        }
+    });
+
+    // Read from stdin
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -361,10 +523,12 @@ async fn main() {
             }
         };
 
-        if let Some(resp) = handle_request(&client, req).await {
+        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx).await {
             let out = serde_json::to_string(&resp).unwrap();
             writeln!(stdout, "{}", out).unwrap();
             stdout.flush().unwrap();
         }
     }
+
+    stdout_handle.abort();
 }
