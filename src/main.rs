@@ -1,16 +1,32 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use base64::prelude::*;
+use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
 use futures::StreamExt;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+#[derive(Parser)]
+#[command(name = "nubi-mcp", about = "MCP server for nubi")]
+struct Args {
+    /// Run as a hosted multi-tenant HTTP MCP server on this address
+    /// (e.g. 0.0.0.0:8090). Agents authenticate per request with
+    /// `Authorization: Bearer <token>`; without this flag the server
+    /// speaks MCP over stdio using NUBI_TOKEN/NUBI_SPACE from the env.
+    #[arg(long)]
+    http: Option<SocketAddr>,
+}
 
 // --- Config ---
 
@@ -64,10 +80,11 @@ struct NubiClient {
 
 impl NubiClient {
     fn new(config: Arc<RwLock<Config>>) -> Self {
-        Self {
-            config,
-            http: reqwest::Client::new(),
-        }
+        Self::with_http(config, reqwest::Client::new())
+    }
+
+    fn with_http(config: Arc<RwLock<Config>>, http: reqwest::Client) -> Self {
+        Self { config, http }
     }
 
     async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
@@ -306,7 +323,40 @@ struct JsonRpcError {
     message: String,
 }
 
-fn tools_list() -> Value {
+/// Tools that only make sense for a locally spawned stdio server
+/// (push notifications over stdout, token file reloads).
+const LOCAL_ONLY_TOOLS: [&str; 3] = ["nubi_subscribe", "nubi_unsubscribe", "nubi_reload"];
+
+fn negotiate_version(params: &Value) -> String {
+    match params["protocolVersion"].as_str() {
+        Some(v @ ("2024-11-05" | "2025-03-26" | "2025-06-18")) => v.to_string(),
+        _ => "2025-06-18".to_string(),
+    }
+}
+
+fn initialize_result(params: &Value) -> Value {
+    json!({
+        "protocolVersion": negotiate_version(params),
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" }
+    })
+}
+
+fn tools_list(hosted: bool) -> Value {
+    let mut list = tools_list_full();
+    if hosted {
+        if let Some(tools) = list["tools"].as_array_mut() {
+            tools.retain(|t| {
+                !t["name"]
+                    .as_str()
+                    .is_some_and(|n| LOCAL_ONLY_TOOLS.contains(&n))
+            });
+        }
+    }
+    list
+}
+
+fn tools_list_full() -> Value {
     json!({
         "tools": [
             {
@@ -590,13 +640,10 @@ async fn handle_request(
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Option<JsonRpcResponse> {
     let result = match req.method.as_str() {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" }
-        })),
+        "initialize" => Ok(initialize_result(&req.params)),
         "notifications/initialized" => return None,
-        "tools/list" => Ok(tools_list()),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(tools_list(false)),
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
             let args = &req.params["arguments"];
@@ -629,8 +676,202 @@ async fn handle_request(
     })
 }
 
+// --- Hosted HTTP mode (Streamable HTTP, stateless) ---
+
+#[derive(Clone)]
+struct HttpState {
+    base_url: String,
+    http: reqwest::Client,
+    /// token -> space_id, filled from GET /v1/me on first use.
+    /// Only successfully authenticated tokens are cached, so size is
+    /// bounded by the number of valid keys in the engine.
+    me_cache: Arc<RwLock<HashMap<String, String>>>,
+}
+
+async fn resolve_space(state: &HttpState, token: &str) -> Result<String, String> {
+    if let Some(space) = state.me_cache.read().await.get(token) {
+        return Ok(space.clone());
+    }
+
+    let res = state
+        .http
+        .get(format!("{}/v1/me", state.base_url))
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("token rejected by engine (HTTP {}): {}", status, text));
+    }
+
+    let me: Value = res.json().await.map_err(|e| e.to_string())?;
+    let space = me["space_id"]
+        .as_str()
+        .ok_or("engine /v1/me returned no space_id")?
+        .to_string();
+
+    state
+        .me_cache
+        .write()
+        .await
+        .insert(token.to_string(), space.clone());
+
+    Ok(space)
+}
+
+fn rpc_ok(id: Value, result: Value) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: Some(result),
+        error: None,
+    }
+}
+
+fn rpc_err(id: Value, code: i32, message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: None,
+        error: Some(JsonRpcError { code, message }),
+    }
+}
+
+fn tool_text_result(text: String, is_error: bool) -> Value {
+    let mut v = json!({ "content": [{ "type": "text", "text": text }] });
+    if is_error {
+        v["isError"] = json!(true);
+    }
+    v
+}
+
+async fn handle_http_request(state: &HttpState, token: &str, req: JsonRpcRequest) -> JsonRpcResponse {
+    match req.method.as_str() {
+        "initialize" => rpc_ok(req.id, initialize_result(&req.params)),
+        "ping" => rpc_ok(req.id, json!({})),
+        "tools/list" => rpc_ok(req.id, tools_list(true)),
+        "tools/call" => {
+            let name = req.params["name"].as_str().unwrap_or("");
+            let args = &req.params["arguments"];
+
+            if LOCAL_ONLY_TOOLS.contains(&name) {
+                return rpc_ok(req.id, tool_text_result(
+                    format!("Error: {} is only available when running nubi-mcp locally over stdio. For realtime messages use nubi_poll with wait_ms.", name),
+                    true,
+                ));
+            }
+
+            let space_id = match resolve_space(state, token).await {
+                Ok(s) => s,
+                Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
+            };
+
+            let config = Arc::new(RwLock::new(Config {
+                base_url: state.base_url.clone(),
+                token: token.to_string(),
+                space_id,
+                token_file: None,
+            }));
+            let client = NubiClient::with_http(config.clone(), state.http.clone());
+
+            // Hosted mode never spawns subscriptions; these satisfy the
+            // shared handle_tool_call signature.
+            let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
+            let (notify_tx, _notify_rx) = mpsc::unbounded_channel::<Value>();
+
+            match handle_tool_call(&client, name, args, &config, &subscriptions, &notify_tx).await {
+                Ok(v) => rpc_ok(
+                    req.id,
+                    tool_text_result(serde_json::to_string_pretty(&v).unwrap(), false),
+                ),
+                Err(e) => rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
+            }
+        }
+        other => rpc_err(req.id, -32601, format!("unknown method: {}", other)),
+    }
+}
+
+async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string());
+
+    let Some(token) = token else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            axum::Json(json!({ "error": "missing Authorization: Bearer <token> header" })),
+        )
+            .into_response();
+    };
+
+    let msg: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return axum::Json(rpc_err(Value::Null, -32700, format!("parse error: {}", e)))
+                .into_response()
+        }
+    };
+
+    // Notifications and responses carry no id; acknowledge without a body.
+    if msg.get("id").map_or(true, Value::is_null) {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    let req: JsonRpcRequest = match serde_json::from_value(msg) {
+        Ok(r) => r,
+        Err(e) => {
+            return axum::Json(rpc_err(Value::Null, -32600, format!("invalid request: {}", e)))
+                .into_response()
+        }
+    };
+
+    axum::Json(handle_http_request(&state, &token, req).await).into_response()
+}
+
+async fn run_http(addr: SocketAddr) {
+    let base_url = std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let state = HttpState {
+        base_url: base_url.clone(),
+        http: reqwest::Client::new(),
+        me_cache: Arc::new(RwLock::new(HashMap::new())),
+    };
+
+    let app = axum::Router::new()
+        .route("/mcp", axum::routing::post(mcp_post))
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .with_state(state);
+
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("failed to bind {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("nubi-mcp hosted mode on http://{}/mcp (engine: {})", addr, base_url);
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
+    if let Some(addr) = args.http {
+        run_http(addr).await;
+        return;
+    }
+
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
