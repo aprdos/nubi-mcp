@@ -13,9 +13,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 uuid = { version = "1", features = ["v4"] }
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
-thiserror = "2"
 futures = "0.3"
 tokio-stream = "0.1"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-base64 = "0.22"
-rand = "0.8"

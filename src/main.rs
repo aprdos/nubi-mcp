@@ -3,16 +3,12 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::prelude::*;
 use clap::Parser;
-use ed25519_dalek::{Signer, SigningKey};
 use futures::StreamExt;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -36,6 +32,9 @@ struct Config {
     token: String,
     space_id: String,
     token_file: Option<PathBuf>,
+    /// Rooms to subscribe to at startup: `*` for every room the caller belongs
+    /// to, or a comma-separated list of room ids.
+    subscribe: Option<String>,
 }
 
 impl Config {
@@ -55,6 +54,9 @@ impl Config {
             token,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
             token_file,
+            subscribe: std::env::var("NUBI_SUBSCRIBE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         })
     }
 
@@ -87,10 +89,17 @@ impl NubiClient {
         Self { config, http }
     }
 
-    async fn request(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value, String> {
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
         let config = self.config.read().await;
         let url = format!("{}{}", config.base_url, path);
-        let mut req = self.http.request(method, &url)
+        let mut req = self
+            .http
+            .request(method, &url)
             .header("Authorization", format!("Bearer {}", config.token))
             .header("Content-Type", "application/json");
 
@@ -125,39 +134,92 @@ impl NubiClient {
 
     async fn create_room(&self, name: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        self.request(reqwest::Method::POST, &path, Some(json!({ "name": name }))).await
+        self.request(reqwest::Method::POST, &path, Some(json!({ "name": name })))
+            .await
     }
 
     async fn get_or_create_dm(&self, with_agent: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/dms", self.space_id().await);
-        self.request(reqwest::Method::POST, &path, Some(json!({ "with": with_agent }))).await
+        self.request(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({ "with": with_agent })),
+        )
+        .await
     }
 
-    async fn send_message(&self, room_id: &str, text: &str, mentions: Vec<String>) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms/{}/messages", self.space_id().await, room_id);
+    async fn send_message(
+        &self,
+        room_id: &str,
+        text: &str,
+        mentions: Vec<String>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/messages",
+            self.space_id().await,
+            room_id
+        );
         let message_id = uuid::Uuid::new_v4().to_string();
-        self.request(reqwest::Method::POST, &path, Some(json!({
-            "message_id": message_id,
-            "parts": [{ "kind": "text", "text": text }],
-            "mentions": mentions
-        }))).await
+        self.request(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({
+                "message_id": message_id,
+                "parts": [{ "kind": "text", "text": text }],
+                "mentions": mentions
+            })),
+        )
+        .await
     }
 
-    async fn poll(&self, room_id: &str, from_index: Option<u64>, max_tokens: Option<u32>, mentioned_only: bool, wait_ms: Option<u64>) -> Result<Value, String> {
-        let mut path = format!("/v1/spaces/{}/rooms/{}/messages", self.space_id().await, room_id);
+    async fn poll(
+        &self,
+        room_id: &str,
+        from_index: Option<u64>,
+        max_tokens: Option<u32>,
+        mentioned_only: bool,
+        wait_ms: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut path = format!(
+            "/v1/spaces/{}/rooms/{}/messages",
+            self.space_id().await,
+            room_id
+        );
         let mut params = vec![];
-        if let Some(idx) = from_index { params.push(format!("from_index={}", idx)); }
-        if let Some(t) = max_tokens { params.push(format!("max_tokens={}", t)); }
-        if mentioned_only { params.push("mentioned_only=true".into()); }
-        if let Some(w) = wait_ms { params.push(format!("wait_ms={}", w)); }
-        if !params.is_empty() { path = format!("{}?{}", path, params.join("&")); }
+        if let Some(idx) = from_index {
+            params.push(format!("from_index={}", idx));
+        }
+        if let Some(t) = max_tokens {
+            params.push(format!("max_tokens={}", t));
+        }
+        if mentioned_only {
+            params.push("mentioned_only=true".into());
+        }
+        if let Some(w) = wait_ms {
+            params.push(format!("wait_ms={}", w));
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
+        }
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn search(&self, room_id: &str, query: &str, from_index: Option<u64>) -> Result<Value, String> {
+    async fn search(
+        &self,
+        room_id: &str,
+        query: &str,
+        from_index: Option<u64>,
+    ) -> Result<Value, String> {
         let encoded_query = urlencoding(query);
-        let mut path = format!("/v1/spaces/{}/rooms/{}/search?q={}", self.space_id().await, room_id, encoded_query);
-        if let Some(idx) = from_index { path = format!("{}&from_index={}", path, idx); }
+        let mut path = format!(
+            "/v1/spaces/{}/rooms/{}/search?q={}",
+            self.space_id().await,
+            room_id,
+            encoded_query
+        );
+        if let Some(idx) = from_index {
+            path = format!("{}&from_index={}", path, idx);
+        }
         self.request(reqwest::Method::GET, &path, None).await
     }
 
@@ -166,38 +228,26 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn invite_member(&self, room_id: &str, agent_id: &str, role: &str) -> Result<Value, String> {
-        let path = format!("/v1/spaces/{}/rooms/{}/invite", self.space_id().await, room_id);
-        self.request(reqwest::Method::POST, &path, Some(json!({
-            "agent_id": agent_id,
-            "role": role
-        }))).await
-    }
-
-    async fn self_register(&self, agent_id: &str, name: &str, public_key: &str, signature: &str, timestamp_ms: u64) -> Result<Value, String> {
-        let config = self.config.read().await;
-        let url = format!("{}/v1/spaces/{}/register", config.base_url, config.space_id);
-        drop(config);
-        let res = self.http.post(&url)
-            .header("Content-Type", "application/json")
-            .json(&json!({
+    async fn invite_member(
+        &self,
+        room_id: &str,
+        agent_id: &str,
+        role: &str,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/invite",
+            self.space_id().await,
+            room_id
+        );
+        self.request(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({
                 "agent_id": agent_id,
-                "name": name,
-                "public_key": public_key,
-                "signature": signature,
-                "timestamp_ms": timestamp_ms
-            }))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let text = res.text().await.unwrap_or_default();
-            return Err(format!("HTTP {}: {}", status, text));
-        }
-
-        res.json().await.map_err(|e| e.to_string())
+                "role": role
+            })),
+        )
+        .await
     }
 
     async fn reload_token(&self) -> Result<(), String> {
@@ -226,73 +276,301 @@ fn urlencoding(s: &str) -> String {
 
 type Subscriptions = Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>;
 
-async fn start_subscription(
-    config: Config,
-    room_id: String,
+const RECONNECT_MIN_DELAY_MS: u64 = 500;
+const RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+
+fn channel_notification(content: String, meta: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": { "content": content, "meta": meta }
+    })
+}
+
+enum Outcome {
+    /// Connected, then the stream ended or broke. Resume from `last_event_id`.
+    Disconnected,
+    /// Never connected. Back off before trying again.
+    ConnectFailed(String),
+    /// Retrying cannot help (bad token, room gone). Give up.
+    Fatal(String),
+}
+
+/// What a subscription listens to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Target {
+    Room(String),
+    /// Every room the caller belongs to, fanned in server-side over one
+    /// connection. New rooms are picked up without resubscribing.
+    Space,
+}
+
+/// `*` means the whole space; anything else is a room id.
+impl From<&str> for Target {
+    fn from(s: &str) -> Self {
+        if s == "*" {
+            Target::Space
+        } else {
+            Target::Room(s.to_string())
+        }
+    }
+}
+
+impl Target {
+    /// Key in the subscription map, and the label shown in notifications.
+    fn key(&self) -> &str {
+        match self {
+            Target::Room(room_id) => room_id,
+            Target::Space => "*",
+        }
+    }
+
+    fn url(&self, config: &Config, mentioned_only: bool) -> String {
+        let suffix = if mentioned_only {
+            "?mentioned_only=true"
+        } else {
+            ""
+        };
+        match self {
+            Target::Room(room_id) => format!(
+                "{}/v1/spaces/{}/rooms/{}/stream{}",
+                config.base_url, config.space_id, room_id, suffix
+            ),
+            Target::Space => format!(
+                "{}/v1/spaces/{}/stream{}",
+                config.base_url, config.space_id, suffix
+            ),
+        }
+    }
+}
+
+/// Parses `NUBI_SUBSCRIBE` into the subscriptions to open at startup.
+fn startup_targets(spec: &str) -> Vec<Target> {
+    let mut targets = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let target = Target::from(part);
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    // The space stream already covers every room, so individual rooms alongside
+    // it would deliver everything twice.
+    if targets.contains(&Target::Space) {
+        vec![Target::Space]
+    } else {
+        targets
+    }
+}
+
+/// Starts a subscription unless one is already running for the same target.
+/// Returns false if it was already subscribed.
+async fn spawn_subscription(
+    subscriptions: &Subscriptions,
+    config: &Arc<RwLock<Config>>,
+    target: Target,
+    mentioned_only: bool,
+    notify_tx: &mpsc::UnboundedSender<Value>,
+) -> bool {
+    let mut subs = subscriptions.lock().await;
+    // A finished task means the subscription died; replace it rather than
+    // reporting a listener that is no longer there.
+    if subs.get(target.key()).is_some_and(|h| !h.is_finished()) {
+        return false;
+    }
+
+    let key = target.key().to_string();
+    let cfg = config.clone();
+    let tx = notify_tx.clone();
+    let handle =
+        tokio::spawn(async move { run_subscription(cfg, target, mentioned_only, tx).await });
+
+    subs.insert(key, handle);
+    true
+}
+
+/// Keeps an SSE subscription alive across network failures, resuming from the
+/// last delivered event id so no messages are dropped in the gap. Only returns
+/// on a fatal error; otherwise the caller aborts it via `nubi_unsubscribe`.
+async fn run_subscription(
+    config: Arc<RwLock<Config>>,
+    target: Target,
     mentioned_only: bool,
     notify_tx: mpsc::UnboundedSender<Value>,
-) -> Result<(), String> {
+) {
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/spaces/{}/rooms/{}/stream{}",
-        config.base_url, config.space_id, room_id,
-        if mentioned_only { "?mentioned_only=true" } else { "" });
+    let mut last_event_id: Option<String> = None;
+    let mut delay_ms = RECONNECT_MIN_DELAY_MS;
 
-    let res = client.get(&url)
+    loop {
+        let cfg = config.read().await.clone();
+        let outcome = stream_once(
+            &client,
+            &cfg,
+            &target,
+            mentioned_only,
+            &mut last_event_id,
+            &notify_tx,
+        )
+        .await;
+
+        match outcome {
+            Outcome::Disconnected => delay_ms = RECONNECT_MIN_DELAY_MS,
+            Outcome::ConnectFailed(err) => {
+                eprintln!(
+                    "nubi: stream {} reconnect in {}ms: {}",
+                    target.key(),
+                    delay_ms,
+                    err
+                );
+            }
+            Outcome::Fatal(err) => {
+                let _ = notify_tx.send(channel_notification(
+                    format!("[{}] subscription stopped: {}", target.key(), err),
+                    json!({ "room_id": target.key(), "event": "subscription_failed" }),
+                ));
+                return;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 2).min(RECONNECT_MAX_DELAY_MS);
+    }
+}
+
+async fn stream_once(
+    client: &reqwest::Client,
+    config: &Config,
+    target: &Target,
+    mentioned_only: bool,
+    last_event_id: &mut Option<String>,
+    notify_tx: &mpsc::UnboundedSender<Value>,
+) -> Outcome {
+    let url = target.url(config, mentioned_only);
+
+    let mut req = client
+        .get(&url)
         .header("Authorization", format!("Bearer {}", config.token))
-        .header("Accept", "text/event-stream")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .header("Accept", "text/event-stream");
+    // The space stream resumes from each room's committed offset instead, since
+    // one event id cannot describe a position in every room at once.
+    if let (Target::Room(_), Some(id)) = (target, last_event_id.as_deref()) {
+        req = req.header("Last-Event-ID", id);
+    }
 
-    if !res.status().is_success() {
-        return Err(format!("SSE connect failed: {}", res.status()));
+    let res = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Outcome::ConnectFailed(e.to_string()),
+    };
+
+    let status = res.status();
+    if !status.is_success() {
+        let msg = format!("SSE connect failed: {}", status);
+        return if matches!(status.as_u16(), 401 | 403 | 404) {
+            Outcome::Fatal(msg)
+        } else {
+            Outcome::ConnectFailed(msg)
+        };
     }
 
     let mut stream = res.bytes_stream();
     let mut buffer = String::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&chunk);
-        buffer.push_str(&text);
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("nubi: stream {} broke: {}", target.key(), e);
+                return Outcome::Disconnected;
+            }
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Parse SSE events from buffer
         while let Some(pos) = buffer.find("\n\n") {
             let event_text = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
+            buffer.drain(..pos + 2);
 
-            // Parse event
             let mut event_type = String::new();
             let mut data = String::new();
             let mut id = String::new();
 
             for line in event_text.lines() {
-                if line.starts_with("event:") {
-                    event_type = line[6..].trim().to_string();
-                } else if line.starts_with("data:") {
-                    data = line[5..].trim().to_string();
-                } else if line.starts_with("id:") {
-                    id = line[3..].trim().to_string();
+                if let Some(rest) = line.strip_prefix("event:") {
+                    event_type = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    data = rest.trim().to_string();
+                } else if let Some(rest) = line.strip_prefix("id:") {
+                    id = rest.trim().to_string();
                 }
             }
 
-            // Skip pings and empty events
-            if event_type == "entry" && !data.is_empty() {
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/message",
-                    "params": {
-                        "room_id": room_id,
-                        "event_id": id,
-                        "entry": serde_json::from_str::<Value>(&data).unwrap_or(Value::Null)
-                    }
-                });
-                let _ = notify_tx.send(notification);
+            if !id.is_empty() {
+                *last_event_id = Some(id.clone());
             }
+
+            if data.is_empty() {
+                continue;
+            }
+
+            let parsed: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+
+            // The space stream reports a room it can no longer read (kicked,
+            // archived) without tearing down the rest of the connection.
+            if event_type == "room_error" {
+                let room = parsed["room_id"].as_str().unwrap_or("unknown");
+                let message = parsed["error"]["message"]
+                    .as_str()
+                    .unwrap_or("stream error");
+                let _ = notify_tx.send(channel_notification(
+                    format!("[{}] room unavailable: {}", room, message),
+                    json!({ "room_id": room, "event": "room_error" }),
+                ));
+                continue;
+            }
+
+            if event_type != "entry" {
+                continue;
+            }
+
+            // The space stream wraps each entry so it carries its room;
+            // a single-room stream sends the bare entry.
+            let (room_id, entry) = match target {
+                Target::Room(room_id) => (room_id.as_str(), &parsed),
+                Target::Space => (
+                    parsed["room_id"].as_str().unwrap_or("unknown"),
+                    &parsed["entry"],
+                ),
+            };
+
+            let sender = entry["sender"].as_str().unwrap_or("unknown");
+            let payload = &entry["payload"];
+
+            let content = if payload["type"].as_str() == Some("message") {
+                let text = payload["parts"]
+                    .as_array()
+                    .and_then(|p| p.first())
+                    .and_then(|p| p["text"].as_str())
+                    .unwrap_or("");
+                format!("[{}] {}: {}", room_id, sender, text)
+            } else if payload["type"].as_str() == Some("system") {
+                let kind = payload["kind"].as_str().unwrap_or("event");
+                format!("[{}] system: {}", room_id, kind)
+            } else {
+                format!("[{}] {}: (event)", room_id, sender)
+            };
+
+            let _ = notify_tx.send(channel_notification(
+                content,
+                json!({
+                    "room_id": room_id,
+                    "event_id": id,
+                    "sender": sender,
+                    "payload_type": payload["type"].as_str().unwrap_or("unknown")
+                }),
+            ));
         }
     }
 
-    Ok(())
+    Outcome::Disconnected
 }
 
 // --- MCP Protocol ---
@@ -337,8 +615,14 @@ fn negotiate_version(params: &Value) -> String {
 fn initialize_result(params: &Value) -> Value {
     json!({
         "protocolVersion": negotiate_version(params),
-        "capabilities": { "tools": {} },
-        "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" }
+        "capabilities": {
+            "tools": {},
+            "experimental": {
+                "claude/channel": {}
+            }
+        },
+        "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" },
+        "instructions": "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages."
     })
 }
 
@@ -439,11 +723,11 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_subscribe",
-                "description": "Subscribe to real-time messages in a room. Messages will be delivered as notifications.",
+                "description": "Subscribe to real-time messages. Messages will be delivered as notifications. Pass \"*\" as room_id to receive every room you belong to, including rooms you join later.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
+                        "room_id": { "type": "string", "description": "Room to subscribe to, or \"*\" for every room you belong to" },
                         "mentioned_only": { "type": "boolean", "description": "Only receive messages that mention you" }
                     },
                     "required": ["room_id"]
@@ -451,10 +735,10 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_unsubscribe",
-                "description": "Unsubscribe from a room's real-time messages",
+                "description": "Unsubscribe from real-time messages. Pass \"*\" to stop an all-rooms subscription.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "room_id": { "type": "string" } },
+                    "properties": { "room_id": { "type": "string", "description": "Room to unsubscribe from, or \"*\" for the all-rooms subscription" } },
                     "required": ["room_id"]
                 }
             },
@@ -469,24 +753,6 @@ fn tools_list_full() -> Value {
                         "role": { "type": "string", "enum": ["member", "admin", "readonly"], "default": "member" }
                     },
                     "required": ["room_id", "agent_id"]
-                }
-            },
-            {
-                "name": "nubi_generate_keypair",
-                "description": "Generate an ed25519 keypair for self-registration. Returns public key and private key (keep private key secret!)",
-                "inputSchema": { "type": "object", "properties": {} }
-            },
-            {
-                "name": "nubi_self_register",
-                "description": "Self-register as a new agent using a keypair. Proves identity by signing with private key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "agent_id": { "type": "string", "description": "Your desired agent ID" },
-                        "name": { "type": "string", "description": "Display name" },
-                        "private_key": { "type": "string", "description": "Your private key from nubi_generate_keypair" }
-                    },
-                    "required": ["agent_id", "name", "private_key"]
                 }
             },
             {
@@ -525,7 +791,11 @@ async fn handle_tool_call(
             let text = args["text"].as_str().ok_or("text required")?;
             let mentions: Vec<String> = args["mentions"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             client.send_message(room_id, text, mentions).await
         }
@@ -535,7 +805,9 @@ async fn handle_tool_call(
             let max_tokens = args["max_tokens"].as_u64().map(|v| v as u32);
             let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
             let wait_ms = args["wait_ms"].as_u64();
-            client.poll(room_id, from_index, max_tokens, mentioned_only, wait_ms).await
+            client
+                .poll(room_id, from_index, max_tokens, mentioned_only, wait_ms)
+                .await
         }
         "nubi_search" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -550,73 +822,29 @@ async fn handle_tool_call(
             let role = args["role"].as_str().unwrap_or("member");
             client.invite_member(room_id, agent_id, role).await
         }
-        "nubi_generate_keypair" => {
-            let signing_key = SigningKey::generate(&mut OsRng);
-            let verifying_key = signing_key.verifying_key();
-
-            let private_key = BASE64_STANDARD.encode(signing_key.to_bytes());
-            let public_key = format!("ed25519:{}", BASE64_STANDARD.encode(verifying_key.as_bytes()));
-
-            Ok(json!({
-                "public_key": public_key,
-                "private_key": private_key,
-                "warning": "Keep your private_key SECRET! Never share it. Use it with nubi_self_register to create your agent."
-            }))
-        }
-        "nubi_self_register" => {
-            let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
-            let name = args["name"].as_str().ok_or("name required")?;
-            let private_key_b64 = args["private_key"].as_str().ok_or("private_key required")?;
-
-            // Decode private key
-            let private_key_bytes = BASE64_STANDARD.decode(private_key_b64)
-                .map_err(|_| "invalid private_key base64")?;
-            let private_key_arr: [u8; 32] = private_key_bytes.try_into()
-                .map_err(|_| "private_key must be 32 bytes")?;
-            let signing_key = SigningKey::from_bytes(&private_key_arr);
-            let verifying_key = signing_key.verifying_key();
-
-            // Get current timestamp
-            let timestamp_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_millis() as u64;
-
-            // Create message to sign: "{space_id}:{agent_id}:{timestamp_ms}"
-            let space_id = client.space_id().await;
-            let message = format!("{}:{}:{}", space_id, agent_id, timestamp_ms);
-            let signature = signing_key.sign(message.as_bytes());
-
-            // Format public key and signature
-            let public_key = format!("ed25519:{}", BASE64_STANDARD.encode(verifying_key.as_bytes()));
-            let signature_b64 = BASE64_STANDARD.encode(signature.to_bytes());
-
-            // Call self-register endpoint
-            client.self_register(agent_id, name, &public_key, &signature_b64, timestamp_ms).await
-        }
         "nubi_reload" => {
             client.reload_token().await?;
             Ok(json!({ "status": "reloaded", "message": "Token reloaded from file" }))
         }
         "nubi_subscribe" => {
-            let room_id = args["room_id"].as_str().ok_or("room_id required")?.to_string();
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
 
-            let mut subs = subscriptions.lock().await;
-            if subs.contains_key(&room_id) {
-                return Ok(json!({ "status": "already_subscribed", "room_id": room_id }));
-            }
+            let started = spawn_subscription(
+                subscriptions,
+                config,
+                Target::from(room_id),
+                mentioned_only,
+                notify_tx,
+            )
+            .await;
 
-            let cfg = config.read().await.clone();
-            let rid = room_id.clone();
-            let tx = notify_tx.clone();
-
-            let handle = tokio::spawn(async move {
-                let _ = start_subscription(cfg, rid, mentioned_only, tx).await;
-            });
-
-            subs.insert(room_id.clone(), handle);
-            Ok(json!({ "status": "subscribed", "room_id": room_id }))
+            let status = if started {
+                "subscribed"
+            } else {
+                "already_subscribed"
+            };
+            Ok(json!({ "status": status, "room_id": room_id }))
         }
         "nubi_unsubscribe" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -671,7 +899,10 @@ async fn handle_request(
             jsonrpc: "2.0".into(),
             id: req.id,
             result: None,
-            error: Some(JsonRpcError { code: -32603, message: e }),
+            error: Some(JsonRpcError {
+                code: -32603,
+                message: e,
+            }),
         },
     })
 }
@@ -704,7 +935,10 @@ async fn resolve_space(state: &HttpState, token: &str) -> Result<String, String>
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("token rejected by engine (HTTP {}): {}", status, text));
+        return Err(format!(
+            "token rejected by engine (HTTP {}): {}",
+            status, text
+        ));
     }
 
     let me: Value = res.json().await.map_err(|e| e.to_string())?;
@@ -748,7 +982,11 @@ fn tool_text_result(text: String, is_error: bool) -> Value {
     v
 }
 
-async fn handle_http_request(state: &HttpState, token: &str, req: JsonRpcRequest) -> JsonRpcResponse {
+async fn handle_http_request(
+    state: &HttpState,
+    token: &str,
+    req: JsonRpcRequest,
+) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => rpc_ok(req.id, initialize_result(&req.params)),
         "ping" => rpc_ok(req.id, json!({})),
@@ -774,6 +1012,7 @@ async fn handle_http_request(state: &HttpState, token: &str, req: JsonRpcRequest
                 token: token.to_string(),
                 space_id,
                 token_file: None,
+                subscribe: None,
             }));
             let client = NubiClient::with_http(config.clone(), state.http.clone());
 
@@ -819,15 +1058,19 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
     };
 
     // Notifications and responses carry no id; acknowledge without a body.
-    if msg.get("id").map_or(true, Value::is_null) {
+    if msg.get("id").is_none_or(Value::is_null) {
         return StatusCode::ACCEPTED.into_response();
     }
 
     let req: JsonRpcRequest = match serde_json::from_value(msg) {
         Ok(r) => r,
         Err(e) => {
-            return axum::Json(rpc_err(Value::Null, -32600, format!("invalid request: {}", e)))
-                .into_response()
+            return axum::Json(rpc_err(
+                Value::Null,
+                -32600,
+                format!("invalid request: {}", e),
+            ))
+            .into_response()
         }
     };
 
@@ -855,7 +1098,10 @@ async fn run_http(addr: SocketAddr) {
         }
     };
 
-    eprintln!("nubi-mcp hosted mode on http://{}/mcp (engine: {})", addr, base_url);
+    eprintln!(
+        "nubi-mcp hosted mode on http://{}/mcp (engine: {})",
+        addr, base_url
+    );
 
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("server error: {}", e);
@@ -878,6 +1124,9 @@ async fn main() {
             eprintln!("Config error: {}", e);
             eprintln!("Required: NUBI_TOKEN or NUBI_TOKEN_FILE, NUBI_SPACE");
             eprintln!("Optional: NUBI_URL (default: http://127.0.0.1:8080)");
+            eprintln!(
+                "Optional: NUBI_SUBSCRIBE (\"*\" for all rooms, or a comma-separated room list; mentions only)"
+            );
             std::process::exit(1);
         }
     };
@@ -886,6 +1135,17 @@ async fn main() {
     let client = NubiClient::new(config.clone());
     let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Value>();
+
+    // Open the configured subscriptions up front, so push does not depend on
+    // the model remembering to call nubi_subscribe. Mentions only: an unfiltered
+    // stream wakes the model for every message in every joined room, which is
+    // noise rather than push. Call nubi_subscribe for the unfiltered firehose.
+    if let Some(spec) = config.read().await.subscribe.clone() {
+        for target in startup_targets(&spec) {
+            eprintln!("nubi: subscribing to {} (mentions only)", target.key());
+            spawn_subscription(&subscriptions, &config, target, true, &notify_tx).await;
+        }
+    }
 
     // Spawn task to write notifications to stdout
     let stdout_handle = tokio::spawn(async move {
@@ -919,7 +1179,8 @@ async fn main() {
             }
         };
 
-        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx).await {
+        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx).await
+        {
             let out = serde_json::to_string(&resp).unwrap();
             writeln!(stdout, "{}", out).unwrap();
             stdout.flush().unwrap();
@@ -927,4 +1188,181 @@ async fn main() {
     }
 
     stdout_handle.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type ResumeLog = Arc<Mutex<Vec<Option<String>>>>;
+    type FlakyState = (ResumeLog, Arc<AtomicUsize>);
+
+    /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
+    /// attempt so the test can assert the client resumes instead of restarting.
+    async fn spawn_flaky_sse() -> (String, ResumeLog) {
+        let seen: ResumeLog = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let state = (seen.clone(), attempts);
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/stream",
+                get(
+                    |State((seen, attempts)): State<FlakyState>,
+                     headers: HeaderMap| async move {
+                        let last = headers
+                            .get("Last-Event-ID")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        seen.lock().await.push(last);
+
+                        let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        let body = format!(
+                            "id: {}\nevent: entry\ndata: {}\n\n",
+                            n,
+                            json!({
+                                "sender": "alice",
+                                "payload": { "type": "message", "parts": [{ "text": format!("msg{}", n) }] }
+                            })
+                        );
+                        Response::builder()
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", addr), seen)
+    }
+
+    #[tokio::test]
+    async fn reconnects_and_resumes_from_last_event_id() {
+        let (base_url, seen) = spawn_flaky_sse().await;
+        let config = Arc::new(RwLock::new(Config {
+            base_url,
+            token: "t".into(),
+            space_id: "s".into(),
+            token_file: None,
+            subscribe: None,
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_subscription(
+            config,
+            Target::Room("r1".into()),
+            false,
+            tx,
+        ));
+
+        let first = rx.recv().await.expect("first event");
+        assert_eq!(first["params"]["content"], "[r1] alice: msg1");
+        let second = rx.recv().await.expect("event after reconnect");
+        assert_eq!(second["params"]["content"], "[r1] alice: msg2");
+        task.abort();
+
+        let attempts = seen.lock().await;
+        assert_eq!(attempts[0], None, "first attempt should not resume");
+        assert_eq!(
+            attempts[1],
+            Some("1".to_string()),
+            "reconnect must resume from the last delivered event id"
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_retrying_when_the_token_is_rejected() {
+        let app = axum::Router::new().route(
+            "/v1/spaces/{space}/rooms/{room}/stream",
+            get(|| async { StatusCode::UNAUTHORIZED }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "bad".into(),
+            space_id: "s".into(),
+            token_file: None,
+            subscribe: None,
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        run_subscription(config, Target::Room("r1".into()), false, tx).await;
+
+        let note = rx.recv().await.expect("failure notification");
+        assert_eq!(note["params"]["meta"]["event"], "subscription_failed");
+    }
+
+    #[tokio::test]
+    async fn space_stream_reports_the_room_each_entry_came_from() {
+        let body = format!(
+            "event: entry\ndata: {}\n\nevent: room_error\ndata: {}\n\n",
+            json!({
+                "room_id": "r2",
+                "entry": {
+                    "sender": "alice",
+                    "payload": { "type": "message", "parts": [{ "text": "hi" }] }
+                }
+            }),
+            json!({ "room_id": "r3", "error": { "code": "excluded", "message": "excluded" } })
+        );
+
+        let app = axum::Router::new().route(
+            "/v1/spaces/{space}/stream",
+            get(|| async move {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            token_file: None,
+            subscribe: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        stream_once(
+            &reqwest::Client::new(),
+            &config,
+            &Target::Space,
+            false,
+            &mut None,
+            &tx,
+        )
+        .await;
+
+        let entry = rx.recv().await.expect("entry notification");
+        assert_eq!(entry["params"]["content"], "[r2] alice: hi");
+        assert_eq!(entry["params"]["meta"]["room_id"], "r2");
+
+        let err = rx.recv().await.expect("room_error notification");
+        assert_eq!(err["params"]["meta"]["event"], "room_error");
+        assert_eq!(err["params"]["meta"]["room_id"], "r3");
+    }
+
+    #[test]
+    fn startup_targets_collapse_into_the_space_stream() {
+        assert_eq!(
+            startup_targets("r1, r2"),
+            vec![Target::Room("r1".into()), Target::Room("r2".into())]
+        );
+        assert_eq!(startup_targets("r1, *"), vec![Target::Space]);
+        assert_eq!(startup_targets(" , "), Vec::new());
+    }
 }
