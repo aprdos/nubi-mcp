@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check, Lint, Test
+    # Falls back to GitHub-hosted whenever USE_SELF_HOSTED is unset; without the
+    # fallback the job queues forever if no self-hosted runner is registered.
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
