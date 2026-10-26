@@ -1,0 +1,62 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.NUBI_PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.NUBI_PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync code to production
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='target' \
+            --exclude='*.log' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ admin@${{ secrets.NUBI_PROD_HOST }}:~/nubi-mcp-prod-src/
+
+      - name: Build and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key admin@${{ secrets.NUBI_PROD_HOST }} << 'EOF'
+            set -e
+            export PATH=$HOME/.cargo/bin:$PATH
+            cd ~/nubi-mcp-prod-src
+
+            echo "==> Building release..."
+            cargo build --release -j2
+
+            echo "==> Stopping nubi-mcp-prod..."
+            sudo systemctl stop nubi-mcp-prod || true
+
+            mv ~/nubi-mcp-prod ~/nubi-mcp-prod.rollback-$(date +%Y%m%d-%H%M) 2>/dev/null || true
+            cp ~/nubi-mcp-prod-src/target/release/nubi-mcp ~/nubi-mcp-prod
+            chmod +x ~/nubi-mcp-prod
+
+            echo "==> Starting nubi-mcp-prod..."
+            sudo systemctl start nubi-mcp-prod
+            sleep 3
+
+            if curl -sf http://127.0.0.1:8090/healthz > /dev/null; then
+              echo "==> Deploy successful!"
+            else
+              echo "==> ERROR: health check failed"
+              sudo systemctl status nubi-mcp-prod --no-pager || true
+              sudo journalctl -u nubi-mcp-prod -n 30 --no-pager || true
+              exit 1
+            fi
+          EOF
