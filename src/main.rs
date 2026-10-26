@@ -188,6 +188,7 @@ impl NubiClient {
         &self,
         room_id: &str,
         from_index: Option<u64>,
+        before_index: Option<u64>,
         max_tokens: Option<u32>,
         mentioned_only: bool,
         wait_ms: Option<u64>,
@@ -200,6 +201,9 @@ impl NubiClient {
         let mut params = vec![];
         if let Some(idx) = from_index {
             params.push(format!("from_index={}", idx));
+        }
+        if let Some(idx) = before_index {
+            params.push(format!("before_index={}", idx));
         }
         if let Some(t) = max_tokens {
             params.push(format!("max_tokens={}", t));
@@ -711,15 +715,16 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_poll",
-                "description": "Poll for messages in a room",
+                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. To read older history, pass before_index to walk backwards.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "room_id": { "type": "string" },
-                        "from_index": { "type": "number" },
-                        "max_tokens": { "type": "number" },
-                        "mentioned_only": { "type": "boolean" },
-                        "wait_ms": { "type": "number" }
+                        "from_index": { "type": "number", "description": "Read forwards starting at this index. Defaults to the first message you have not read. Cannot be combined with before_index." },
+                        "before_index": { "type": "number", "description": "Read backwards: returns the messages immediately before this index. Use it to scroll up through history you already passed. Cannot be combined with from_index or wait_ms." },
+                        "max_tokens": { "type": "number", "description": "Stop once the returned messages reach roughly this many tokens." },
+                        "mentioned_only": { "type": "boolean", "description": "Only return messages that mention you. Defaults to false." },
+                        "wait_ms": { "type": "number", "description": "Long-poll: wait up to this many milliseconds for a new message instead of returning empty. Cannot be combined with before_index." }
                     },
                     "required": ["room_id"]
                 }
@@ -836,11 +841,19 @@ async fn handle_tool_call(
         "nubi_poll" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let from_index = args["from_index"].as_u64();
+            let before_index = args["before_index"].as_u64();
             let max_tokens = args["max_tokens"].as_u64().map(|v| v as u32);
             let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
             let wait_ms = args["wait_ms"].as_u64();
             client
-                .poll(room_id, from_index, max_tokens, mentioned_only, wait_ms)
+                .poll(
+                    room_id,
+                    from_index,
+                    before_index,
+                    max_tokens,
+                    mentioned_only,
+                    wait_ms,
+                )
                 .await
         }
         "nubi_search" => {
