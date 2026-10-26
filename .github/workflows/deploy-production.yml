@@ -1,4 +1,4 @@
-name: Deploy Staging
+name: Deploy Production
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
-      group: deploy-staging
+      group: deploy-production
       cancel-in-progress: true
 
     steps:
