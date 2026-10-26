@@ -32,21 +32,40 @@ struct Config {
     token: String,
     space_id: String,
     token_file: Option<PathBuf>,
+    /// Long-lived refresh token, exchanged at the refresh endpoint to mint a new
+    /// access/refresh pair when the access token expires. Without one, an expired
+    /// token is fatal.
+    refresh_token: Option<String>,
+    refresh_token_file: Option<PathBuf>,
     /// Rooms to subscribe to at startup: `*` for every room the caller belongs
     /// to, or a comma-separated list of room ids.
     subscribe: Option<String>,
+}
+
+fn read_trimmed(path: &PathBuf) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))
 }
 
 impl Config {
     fn from_env() -> Result<Self, String> {
         let token_file = std::env::var("NUBI_TOKEN_FILE").ok().map(PathBuf::from);
         let token = if let Some(ref path) = token_file {
-            std::fs::read_to_string(path)
-                .map_err(|e| format!("failed to read token file: {}", e))?
-                .trim()
-                .to_string()
+            read_trimmed(path)?
         } else {
             std::env::var("NUBI_TOKEN").map_err(|_| "NUBI_TOKEN or NUBI_TOKEN_FILE required")?
+        };
+
+        let refresh_token_file = std::env::var("NUBI_REFRESH_TOKEN_FILE")
+            .ok()
+            .map(PathBuf::from);
+        let refresh_token = if let Some(ref path) = refresh_token_file {
+            Some(read_trimmed(path)?).filter(|s| !s.is_empty())
+        } else {
+            std::env::var("NUBI_REFRESH_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
         };
 
         Ok(Self {
@@ -54,6 +73,8 @@ impl Config {
             token,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
             token_file,
+            refresh_token,
+            refresh_token_file,
             subscribe: std::env::var("NUBI_SUBSCRIBE")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -61,32 +82,126 @@ impl Config {
     }
 
     fn reload_token(&mut self) -> Result<(), String> {
-        if let Some(ref path) = self.token_file {
-            self.token = std::fs::read_to_string(path)
-                .map_err(|e| format!("failed to read token file: {}", e))?
-                .trim()
-                .to_string();
-            Ok(())
-        } else {
-            Err("no token file configured (set NUBI_TOKEN_FILE to enable reload)".into())
+        let Some(ref path) = self.token_file else {
+            return Err("no token file configured (set NUBI_TOKEN_FILE to enable reload)".into());
+        };
+        self.token = read_trimmed(path)?;
+        if let Some(ref path) = self.refresh_token_file {
+            self.refresh_token = Some(read_trimmed(path)?).filter(|s| !s.is_empty());
         }
+        Ok(())
     }
 }
 
 // --- Nubi Client ---
 
+#[derive(Deserialize)]
+struct TokenPair {
+    token: String,
+    refresh_token: String,
+}
+
+/// Exchanges the stored refresh token for a fresh access/refresh pair, persisting
+/// both to their files so a restart (or `nubi_reload`) picks up the rotated pair.
+/// Returns the new access token. `failed_token` is the token whose rejection
+/// triggered the rotation: the lock serializes concurrent rotations, and if the
+/// shared token already moved past `failed_token` a peer rotated first, so we
+/// reuse theirs instead of spending our (now-revoked) refresh token.
+async fn rotate_token(
+    config: &Arc<RwLock<Config>>,
+    http: &reqwest::Client,
+    refresh_lock: &Mutex<()>,
+    failed_token: &str,
+) -> Result<String, String> {
+    let _guard = refresh_lock.lock().await;
+
+    let (base_url, space_id, refresh_token) = {
+        let cfg = config.read().await;
+        if cfg.token != failed_token {
+            return Ok(cfg.token.clone());
+        }
+        let Some(rt) = cfg.refresh_token.clone() else {
+            return Err(
+                "no refresh token configured (set NUBI_REFRESH_TOKEN or NUBI_REFRESH_TOKEN_FILE)"
+                    .into(),
+            );
+        };
+        (cfg.base_url.clone(), cfg.space_id.clone(), rt)
+    };
+
+    let url = format!("{}/v1/spaces/{}/refresh", base_url, space_id);
+    let res = http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&json!({ "refresh_token": refresh_token }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!(
+            "token refresh rejected (HTTP {}): {}",
+            status, text
+        ));
+    }
+
+    let pair: TokenPair = res.json().await.map_err(|e| e.to_string())?;
+
+    let mut cfg = config.write().await;
+    cfg.token = pair.token.clone();
+    cfg.refresh_token = Some(pair.refresh_token.clone());
+    if let Some(ref path) = cfg.token_file {
+        std::fs::write(path, &pair.token)
+            .map_err(|e| format!("failed to persist rotated token: {}", e))?;
+    }
+    if let Some(ref path) = cfg.refresh_token_file {
+        std::fs::write(path, &pair.refresh_token)
+            .map_err(|e| format!("failed to persist rotated refresh token: {}", e))?;
+    }
+    Ok(pair.token)
+}
+
 struct NubiClient {
     config: Arc<RwLock<Config>>,
     http: reqwest::Client,
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl NubiClient {
-    fn new(config: Arc<RwLock<Config>>) -> Self {
-        Self::with_http(config, reqwest::Client::new())
+    fn new(config: Arc<RwLock<Config>>, refresh_lock: Arc<Mutex<()>>) -> Self {
+        Self::with_http(config, reqwest::Client::new(), refresh_lock)
     }
 
-    fn with_http(config: Arc<RwLock<Config>>, http: reqwest::Client) -> Self {
-        Self { config, http }
+    fn with_http(
+        config: Arc<RwLock<Config>>,
+        http: reqwest::Client,
+        refresh_lock: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            config,
+            http,
+            refresh_lock,
+        }
+    }
+
+    async fn send_once(
+        &self,
+        method: &reqwest::Method,
+        url: &str,
+        token: &str,
+        body: &Option<Value>,
+    ) -> Result<reqwest::Response, String> {
+        let mut req = self
+            .http
+            .request(method.clone(), url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json");
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req.send().await.map_err(|e| e.to_string())
     }
 
     async fn request(
@@ -95,19 +210,21 @@ impl NubiClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, String> {
-        let config = self.config.read().await;
-        let url = format!("{}{}", config.base_url, path);
-        let mut req = self
-            .http
-            .request(method, &url)
-            .header("Authorization", format!("Bearer {}", config.token))
-            .header("Content-Type", "application/json");
+        let (token, url) = {
+            let config = self.config.read().await;
+            (config.token.clone(), format!("{}{}", config.base_url, path))
+        };
 
-        if let Some(b) = body {
-            req = req.json(&b);
+        let mut res = self.send_once(&method, &url, &token, &body).await?;
+
+        // A rejected token may just be expired; rotate it and retry once.
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(new_token) =
+                rotate_token(&self.config, &self.http, &self.refresh_lock, &token).await
+            {
+                res = self.send_once(&method, &url, &new_token, &body).await?;
+            }
         }
-
-        let res = req.send().await.map_err(|e| e.to_string())?;
 
         if !res.status().is_success() {
             let status = res.status();
@@ -152,7 +269,8 @@ impl NubiClient {
         &self,
         room_id: &str,
         text: &str,
-        mentions: Vec<String>,
+        mut mentions: Vec<String>,
+        expect_reply: Option<Vec<String>>,
     ) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/messages",
@@ -160,16 +278,27 @@ impl NubiClient {
             room_id
         );
         let message_id = uuid::Uuid::new_v4().to_string();
-        self.request(
-            reqwest::Method::POST,
-            &path,
-            Some(json!({
-                "message_id": message_id,
-                "parts": [{ "kind": "text", "text": text }],
-                "mentions": mentions
-            })),
-        )
-        .await
+
+        // Someone named in expect_reply but not in mentions would never be
+        // delivered the message, so they could never reply.
+        if let Some(ref ids) = expect_reply {
+            for id in ids {
+                if !mentions.iter().any(|m| m == id) {
+                    mentions.push(id.clone());
+                }
+            }
+        }
+
+        let mut body = json!({
+            "message_id": message_id,
+            "parts": [{ "kind": "text", "text": text }],
+            "mentions": mentions
+        });
+        if let Some(ids) = expect_reply {
+            body["metadata"] = json!({ "expect_reply": ids });
+        }
+
+        self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
     async fn poll(
@@ -290,6 +419,9 @@ fn channel_notification(content: String, meta: Value) -> Value {
 enum Outcome {
     /// Connected, then the stream ended or broke. Resume from `last_event_id`.
     Disconnected,
+    /// The token was rejected (401). A refresh may recover it; the caller rotates
+    /// and reconnects, falling back to fatal if no refresh token is configured.
+    Unauthorized,
     /// Never connected. Back off before trying again.
     ConnectFailed(String),
     /// Retrying cannot help (bad token, room gone). Give up.
@@ -370,6 +502,7 @@ async fn spawn_subscription(
     target: Target,
     mentioned_only: bool,
     notify_tx: &mpsc::UnboundedSender<Value>,
+    refresh_lock: &Arc<Mutex<()>>,
 ) -> bool {
     let mut subs = subscriptions.lock().await;
     // A finished task means the subscription died; replace it rather than
@@ -381,8 +514,9 @@ async fn spawn_subscription(
     let key = target.key().to_string();
     let cfg = config.clone();
     let tx = notify_tx.clone();
+    let lock = refresh_lock.clone();
     let handle =
-        tokio::spawn(async move { run_subscription(cfg, target, mentioned_only, tx).await });
+        tokio::spawn(async move { run_subscription(cfg, target, mentioned_only, tx, lock).await });
 
     subs.insert(key, handle);
     true
@@ -396,6 +530,7 @@ async fn run_subscription(
     target: Target,
     mentioned_only: bool,
     notify_tx: mpsc::UnboundedSender<Value>,
+    refresh_lock: Arc<Mutex<()>>,
 ) {
     let client = reqwest::Client::new();
     let mut last_event_id: Option<String> = None;
@@ -415,6 +550,20 @@ async fn run_subscription(
 
         match outcome {
             Outcome::Disconnected => delay_ms = RECONNECT_MIN_DELAY_MS,
+            Outcome::Unauthorized => {
+                // Rotate the expired token, then reconnect reading the fresh one.
+                // No refresh token (or a rejected one) makes this unrecoverable.
+                match rotate_token(&config, &client, &refresh_lock, &cfg.token).await {
+                    Ok(_) => delay_ms = RECONNECT_MIN_DELAY_MS,
+                    Err(err) => {
+                        let _ = notify_tx.send(channel_notification(
+                            format!("[{}] subscription stopped: {}", target.key(), err),
+                            json!({ "room_id": target.key(), "event": "subscription_failed" }),
+                        ));
+                        return;
+                    }
+                }
+            }
             Outcome::ConnectFailed(err) => {
                 eprintln!(
                     "nubi: stream {} reconnect in {}ms: {}",
@@ -464,11 +613,10 @@ async fn stream_once(
 
     let status = res.status();
     if !status.is_success() {
-        let msg = format!("SSE connect failed: {}", status);
-        return if matches!(status.as_u16(), 401 | 403 | 404) {
-            Outcome::Fatal(msg)
-        } else {
-            Outcome::ConnectFailed(msg)
+        return match status.as_u16() {
+            401 => Outcome::Unauthorized,
+            403 | 404 => Outcome::Fatal(format!("SSE connect failed: {}", status)),
+            _ => Outcome::ConnectFailed(format!("SSE connect failed: {}", status)),
         };
     }
 
@@ -683,7 +831,16 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "room_id": { "type": "string" },
                         "text": { "type": "string" },
-                        "mentions": { "type": "array", "items": { "type": "string" } }
+                        "mentions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Agent ids who should see this message. Use 'here' for everyone in the room. Nobody reads a message they are not mentioned in."
+                        },
+                        "expect_reply": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Which of the mentioned agents should answer. Omit it and anyone mentioned may answer. Pass [] for read-only context nobody should reply to. Pass [\"apple\"] when you tag several people but only want apple to respond."
+                        }
                     },
                     "required": ["room_id", "text"]
                 }
@@ -797,7 +954,20 @@ async fn handle_tool_call(
                         .collect()
                 })
                 .unwrap_or_default();
-            client.send_message(room_id, text, mentions).await
+            // Absent must stay absent: collapsing it to an empty list would
+            // tell every receiver to stay quiet.
+            let expect_reply: Option<Vec<String>> = match args.get("expect_reply") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                ),
+                Some(_) => return Err("expect_reply must be an array of agent ids".to_string()),
+            };
+            client
+                .send_message(room_id, text, mentions, expect_reply)
+                .await
         }
         "nubi_poll" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -836,6 +1006,7 @@ async fn handle_tool_call(
                 Target::from(room_id),
                 mentioned_only,
                 notify_tx,
+                &client.refresh_lock,
             )
             .await;
 
@@ -1012,9 +1183,14 @@ async fn handle_http_request(
                 token: token.to_string(),
                 space_id,
                 token_file: None,
+                refresh_token: None,
+                refresh_token_file: None,
                 subscribe: None,
             }));
-            let client = NubiClient::with_http(config.clone(), state.http.clone());
+            // Hosted callers rotate their own tokens, so this client never
+            // refreshes; the lock exists only to satisfy the shared signature.
+            let client =
+                NubiClient::with_http(config.clone(), state.http.clone(), Arc::new(Mutex::new(())));
 
             // Hosted mode never spawns subscriptions; these satisfy the
             // shared handle_tool_call signature.
@@ -1132,7 +1308,8 @@ async fn main() {
     };
 
     let config = Arc::new(RwLock::new(config));
-    let client = NubiClient::new(config.clone());
+    let refresh_lock = Arc::new(Mutex::new(()));
+    let client = NubiClient::new(config.clone(), refresh_lock.clone());
     let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Value>();
 
@@ -1143,7 +1320,15 @@ async fn main() {
     if let Some(spec) = config.read().await.subscribe.clone() {
         for target in startup_targets(&spec) {
             eprintln!("nubi: subscribing to {} (mentions only)", target.key());
-            spawn_subscription(&subscriptions, &config, target, true, &notify_tx).await;
+            spawn_subscription(
+                &subscriptions,
+                &config,
+                target,
+                true,
+                &notify_tx,
+                &refresh_lock,
+            )
+            .await;
         }
     }
 
@@ -1199,6 +1384,89 @@ mod tests {
     type ResumeLog = Arc<Mutex<Vec<Option<String>>>>;
     type FlakyState = (ResumeLog, Arc<AtomicUsize>);
 
+    type SentBodies = Arc<Mutex<Vec<Value>>>;
+
+    /// Accepts message POSTs and records each body so the test can inspect
+    /// exactly what went on the wire.
+    async fn spawn_message_sink() -> (NubiClient, SentBodies) {
+        let sent: SentBodies = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/messages",
+                axum::routing::post(
+                    |State(sent): State<SentBodies>, axum::Json(body): axum::Json<Value>| async move {
+                        sent.lock().await.push(body);
+                        axum::Json(json!({ "ok": true }))
+                    },
+                ),
+            )
+            .with_state(sent.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            token_file: None,
+            refresh_token: None,
+            refresh_token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config, Arc::new(Mutex::new(()))), sent)
+    }
+
+    #[tokio::test]
+    async fn send_without_expect_reply_sends_no_metadata() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message("r1", "hi", vec!["manager".into()], None)
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert!(
+            body.get("metadata").is_none(),
+            "absent expect_reply must not add metadata: {}",
+            body
+        );
+        assert_eq!(body["mentions"], json!(["manager"]));
+    }
+
+    #[tokio::test]
+    async fn send_with_empty_expect_reply_asks_nobody() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message("r1", "fyi", vec!["manager".into()], Some(vec![]))
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert_eq!(body["metadata"], json!({ "expect_reply": [] }));
+    }
+
+    #[tokio::test]
+    async fn send_adds_expect_reply_targets_to_mentions() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message(
+                "r1",
+                "take this",
+                vec!["manager".into()],
+                Some(vec!["apple".into()]),
+            )
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        // apple was never mentioned, so without the union it would never see
+        // the message it is being asked to answer.
+        assert_eq!(body["mentions"], json!(["manager", "apple"]));
+        assert_eq!(body["metadata"], json!({ "expect_reply": ["apple"] }));
+    }
+
     /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
     /// attempt so the test can assert the client resumes instead of restarting.
     async fn spawn_flaky_sse() -> (String, ResumeLog) {
@@ -1250,6 +1518,8 @@ mod tests {
             token: "t".into(),
             space_id: "s".into(),
             token_file: None,
+            refresh_token: None,
+            refresh_token_file: None,
             subscribe: None,
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1259,6 +1529,7 @@ mod tests {
             Target::Room("r1".into()),
             false,
             tx,
+            Arc::new(Mutex::new(())),
         ));
 
         let first = rx.recv().await.expect("first event");
@@ -1291,14 +1562,92 @@ mod tests {
             token: "bad".into(),
             space_id: "s".into(),
             token_file: None,
+            refresh_token: None,
+            refresh_token_file: None,
             subscribe: None,
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        run_subscription(config, Target::Room("r1".into()), false, tx).await;
+        run_subscription(
+            config,
+            Target::Room("r1".into()),
+            false,
+            tx,
+            Arc::new(Mutex::new(())),
+        )
+        .await;
 
         let note = rx.recv().await.expect("failure notification");
         assert_eq!(note["params"]["meta"]["event"], "subscription_failed");
+    }
+
+    #[tokio::test]
+    async fn stream_rotates_the_token_on_401_and_reconnects() {
+        // The stream rejects the stale token but accepts the rotated one; the
+        // refresh endpoint hands out the new pair.
+        async fn stream(headers: HeaderMap) -> Response {
+            let auth = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if auth != "Bearer new" {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            let body = format!(
+                "id: 1\nevent: entry\ndata: {}\n\n",
+                json!({
+                    "sender": "alice",
+                    "payload": { "type": "message", "parts": [{ "text": "hi" }] }
+                })
+            );
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
+
+        async fn refresh() -> Response {
+            axum::Json(json!({
+                "token": "new",
+                "key_id": "k",
+                "refresh_token": "new-refresh"
+            }))
+            .into_response()
+        }
+
+        let app = axum::Router::new()
+            .route("/v1/spaces/{space}/rooms/{room}/stream", get(stream))
+            .route("/v1/spaces/{space}/refresh", axum::routing::post(refresh));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "stale".into(),
+            space_id: "s".into(),
+            token_file: None,
+            refresh_token: Some("refresh".into()),
+            refresh_token_file: None,
+            subscribe: None,
+        }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let task = tokio::spawn(run_subscription(
+            config.clone(),
+            Target::Room("r1".into()),
+            false,
+            tx,
+            Arc::new(Mutex::new(())),
+        ));
+
+        let event = rx.recv().await.expect("event after rotation");
+        assert_eq!(event["params"]["content"], "[r1] alice: hi");
+        task.abort();
+
+        let cfg = config.read().await;
+        assert_eq!(cfg.token, "new");
+        assert_eq!(cfg.refresh_token.as_deref(), Some("new-refresh"));
     }
 
     #[tokio::test]
@@ -1333,6 +1682,8 @@ mod tests {
             token: "t".into(),
             space_id: "s".into(),
             token_file: None,
+            refresh_token: None,
+            refresh_token_file: None,
             subscribe: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();

@@ -90,10 +90,18 @@ Each agent gets its own nubi-mcp instance with its own identity (token). Message
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `NUBI_URL` | Yes | Nubi server URL |
-| `NUBI_TOKEN` | Yes | Agent API token |
+| `NUBI_TOKEN` | Yes* | Agent API token (*or `NUBI_TOKEN_FILE`) |
+| `NUBI_TOKEN_FILE` | No | Path to a file holding the access token |
 | `NUBI_SPACE` | Yes | Space ID |
 | `NUBI_AGENT` | Yes | Agent ID (your identity) |
+| `NUBI_REFRESH_TOKEN` | No | Refresh token; expired access tokens auto-rotate |
+| `NUBI_REFRESH_TOKEN_FILE` | No | Path to a file holding the refresh token |
 | `NUBI_SUBSCRIBE` | No | Auto-subscribe on start (`*` = all rooms) |
+
+When a refresh token is set, an expired access token is rotated automatically and
+the new pair is written back to `NUBI_TOKEN_FILE` / `NUBI_REFRESH_TOKEN_FILE` (if
+configured) so it survives a restart. Without a refresh token, an expired access
+token is fatal.
 
 ---
 
