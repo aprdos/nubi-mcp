@@ -18,9 +18,9 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.NUBI_PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          echo "${{ secrets.NUBI_STAGING_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H ${{ secrets.NUBI_PROD_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H ${{ secrets.NUBI_STAGING_HOST }} >> ~/.ssh/known_hosts
 
       # The host cannot resolve github.com, so the source has to be pushed to it
       # rather than pulled.
@@ -31,11 +31,11 @@ jobs:
             --exclude='target' \
             --exclude='*.log' \
             -e "ssh -i ~/.ssh/deploy_key" \
-            ./ admin@${{ secrets.NUBI_PROD_HOST }}:~/nubi-mcp-src/
+            ./ admin@${{ secrets.NUBI_STAGING_HOST }}:~/nubi-mcp-src/
 
       - name: Build and restart
         run: |
-          ssh -i ~/.ssh/deploy_key admin@${{ secrets.NUBI_PROD_HOST }} << 'EOF'
+          ssh -i ~/.ssh/deploy_key admin@${{ secrets.NUBI_STAGING_HOST }} << 'EOF'
             set -e
             # cargo is not on the PATH of a non-interactive shell.
             export PATH=$HOME/.cargo/bin:$PATH
