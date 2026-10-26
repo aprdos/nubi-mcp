@@ -1,0 +1,68 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.NUBI_PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.NUBI_PROD_HOST }} >> ~/.ssh/known_hosts
+
+      # The host cannot resolve github.com, so the source has to be pushed to it
+      # rather than pulled.
+      - name: Sync code to prod
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='target' \
+            --exclude='*.log' \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            ./ admin@${{ secrets.NUBI_PROD_HOST }}:~/nubi-mcp-src/
+
+      - name: Build and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key admin@${{ secrets.NUBI_PROD_HOST }} << 'EOF'
+            set -e
+            # cargo is not on the PATH of a non-interactive shell.
+            export PATH=$HOME/.cargo/bin:$PATH
+            cd ~/nubi-mcp-src
+
+            echo "==> Building release..."
+            cargo build --release -j2
+
+            # The running binary cannot be overwritten in place (ETXTBSY), so the
+            # service stops before the swap, not after.
+            echo "==> Stopping nubi-mcp..."
+            sudo systemctl stop nubi-mcp
+
+            mv ~/nubi-mcp ~/nubi-mcp.rollback-$(date +%Y%m%d-%H%M) 2>/dev/null || true
+            cp ~/nubi-mcp-src/target/release/nubi-mcp ~/nubi-mcp
+            chmod +x ~/nubi-mcp
+
+            echo "==> Starting nubi-mcp..."
+            sudo systemctl start nubi-mcp
+            sleep 3
+
+            if curl -sf http://127.0.0.1:8089/healthz > /dev/null; then
+              echo "==> Deploy successful!"
+            else
+              echo "==> ERROR: health check failed"
+              sudo systemctl status nubi-mcp --no-pager || true
+              sudo journalctl -u nubi-mcp -n 30 --no-pager || true
+              exit 1
+            fi
+          EOF
