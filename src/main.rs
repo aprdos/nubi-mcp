@@ -31,6 +31,9 @@ struct Config {
     base_url: String,
     token: String,
     space_id: String,
+    /// Who this token belongs to, as the engine reports it. Resolved on first
+    /// use rather than configured, so it cannot disagree with the token.
+    agent_id: Option<String>,
     token_file: Option<PathBuf>,
     /// Rooms to subscribe to at startup: `*` for every room the caller belongs
     /// to, or a comma-separated list of room ids.
@@ -53,6 +56,7 @@ impl Config {
             base_url: std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
             token,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
+            agent_id: None,
             token_file,
             subscribe: std::env::var("NUBI_SUBSCRIBE")
                 .ok()
@@ -74,6 +78,13 @@ impl Config {
 }
 
 // --- Nubi Client ---
+
+/// Mention ids arrive as the model typed them, so `@Manager ` and `manager`
+/// have to compare equal.
+fn same_agent(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_start_matches('@').to_lowercase();
+    norm(a) == norm(b)
+}
 
 struct NubiClient {
     config: Arc<RwLock<Config>>,
@@ -122,6 +133,24 @@ impl NubiClient {
         self.config.read().await.space_id.clone()
     }
 
+    /// Who this token belongs to, asked of the engine once and then cached.
+    ///
+    /// `None` when the lookup fails. Not knowing who we are is a reason to
+    /// leave a message's mentions exactly as written, never to fail the send.
+    async fn self_id(&self) -> Option<String> {
+        if let Some(id) = self.config.read().await.agent_id.clone() {
+            return Some(id);
+        }
+
+        let me = self
+            .request(reqwest::Method::GET, "/v1/me", None)
+            .await
+            .ok()?;
+        let id = me["agent_id"].as_str()?.to_string();
+        self.config.write().await.agent_id = Some(id.clone());
+        Some(id)
+    }
+
     async fn list_rooms(&self) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         self.request(reqwest::Method::GET, &path, None).await
@@ -153,7 +182,7 @@ impl NubiClient {
         room_id: &str,
         text: &str,
         mut mentions: Vec<String>,
-        expect_reply: Option<Vec<String>>,
+        mut expect_reply: Option<Vec<String>>,
     ) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/messages",
@@ -161,6 +190,16 @@ impl NubiClient {
             room_id
         );
         let message_id = uuid::Uuid::new_v4().to_string();
+
+        // Naming yourself wakes nobody — every client drops its own messages
+        // before reading them — but it does read to the room as though one
+        // more participant had been asked. Drop it before the merge below,
+        // which would otherwise put it straight back.
+        if let Some(me) = self.self_id().await {
+            mentions.retain(|m| !same_agent(m, &me));
+            expect_reply =
+                expect_reply.map(|ids| ids.into_iter().filter(|id| !same_agent(id, &me)).collect());
+        }
 
         // Someone named in expect_reply but not in mentions would never be
         // delivered the message, so they could never reply.
@@ -693,7 +732,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_send",
-                "description": "Send a message to a room",
+                "description": "Send a message to a room, and the only way to ask a teammate for something. A message reaches exactly the agents named in mentions: say nothing there and nobody receives it. Whenever the message is a question, a request or a handoff, name who should answer in expect_reply as well, or it lands as something everyone can leave for someone else.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -707,7 +746,7 @@ fn tools_list_full() -> Value {
                         "expect_reply": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Which of the mentioned agents should answer. Omit it and anyone mentioned may answer. Pass [] for read-only context nobody should reply to. Pass [\"apple\"] when you tag several people but only want apple to respond."
+                            "description": "Who is on the hook to answer. Set it on every message that needs a response: [\"apple\"] puts it on apple even when you mentioned others, who then get it as context. Pass [] only for a note nobody should reply to, like an FYI or a status update. Omitting it leaves the message open to whoever feels like answering, which in practice is nobody — so omit it only when you genuinely do not mind."
                         }
                     },
                     "required": ["room_id", "text"]
@@ -960,15 +999,21 @@ async fn handle_request(
 struct HttpState {
     base_url: String,
     http: reqwest::Client,
-    /// token -> space_id, filled from GET /v1/me on first use.
+    /// token -> who it belongs to, filled from GET /v1/me on first use.
     /// Only successfully authenticated tokens are cached, so size is
     /// bounded by the number of valid keys in the engine.
-    me_cache: Arc<RwLock<HashMap<String, String>>>,
+    me_cache: Arc<RwLock<HashMap<String, Me>>>,
 }
 
-async fn resolve_space(state: &HttpState, token: &str) -> Result<String, String> {
-    if let Some(space) = state.me_cache.read().await.get(token) {
-        return Ok(space.clone());
+#[derive(Clone)]
+struct Me {
+    space_id: String,
+    agent_id: String,
+}
+
+async fn resolve_me(state: &HttpState, token: &str) -> Result<Me, String> {
+    if let Some(me) = state.me_cache.read().await.get(token) {
+        return Ok(me.clone());
     }
 
     let res = state
@@ -988,19 +1033,25 @@ async fn resolve_space(state: &HttpState, token: &str) -> Result<String, String>
         ));
     }
 
-    let me: Value = res.json().await.map_err(|e| e.to_string())?;
-    let space = me["space_id"]
-        .as_str()
-        .ok_or("engine /v1/me returned no space_id")?
-        .to_string();
+    let body: Value = res.json().await.map_err(|e| e.to_string())?;
+    let me = Me {
+        space_id: body["space_id"]
+            .as_str()
+            .ok_or("engine /v1/me returned no space_id")?
+            .to_string(),
+        agent_id: body["agent_id"]
+            .as_str()
+            .ok_or("engine /v1/me returned no agent_id")?
+            .to_string(),
+    };
 
     state
         .me_cache
         .write()
         .await
-        .insert(token.to_string(), space.clone());
+        .insert(token.to_string(), me.clone());
 
-    Ok(space)
+    Ok(me)
 }
 
 fn rpc_ok(id: Value, result: Value) -> JsonRpcResponse {
@@ -1049,15 +1100,16 @@ async fn handle_http_request(
                 ));
             }
 
-            let space_id = match resolve_space(state, token).await {
-                Ok(s) => s,
+            let me = match resolve_me(state, token).await {
+                Ok(m) => m,
                 Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
             };
 
             let config = Arc::new(RwLock::new(Config {
                 base_url: state.base_url.clone(),
                 token: token.to_string(),
-                space_id,
+                space_id: me.space_id,
+                agent_id: Some(me.agent_id),
                 token_file: None,
                 subscribe: None,
             }));
@@ -1271,6 +1323,7 @@ mod tests {
             base_url: format!("http://{}", addr),
             token: "t".into(),
             space_id: "s".into(),
+            agent_id: Some("me".into()),
             token_file: None,
             subscribe: None,
         }));
@@ -1326,6 +1379,24 @@ mod tests {
         assert_eq!(body["metadata"], json!({ "expect_reply": ["apple"] }));
     }
 
+    #[tokio::test]
+    async fn send_drops_self_from_mentions_and_expect_reply() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message(
+                "r1",
+                "status",
+                vec!["banana".into(), "@Me ".into()],
+                Some(vec!["me".into(), "banana".into()]),
+            )
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert_eq!(body["mentions"], json!(["banana"]));
+        assert_eq!(body["metadata"], json!({ "expect_reply": ["banana"] }));
+    }
+
     /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
     /// attempt so the test can assert the client resumes instead of restarting.
     async fn spawn_flaky_sse() -> (String, ResumeLog) {
@@ -1376,6 +1447,7 @@ mod tests {
             base_url,
             token: "t".into(),
             space_id: "s".into(),
+            agent_id: None,
             token_file: None,
             subscribe: None,
         }));
@@ -1417,6 +1489,7 @@ mod tests {
             base_url: format!("http://{}", addr),
             token: "bad".into(),
             space_id: "s".into(),
+            agent_id: None,
             token_file: None,
             subscribe: None,
         }));
@@ -1459,6 +1532,7 @@ mod tests {
             base_url: format!("http://{}", addr),
             token: "t".into(),
             space_id: "s".into(),
+            agent_id: None,
             token_file: None,
             subscribe: None,
         };
