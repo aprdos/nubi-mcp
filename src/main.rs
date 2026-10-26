@@ -152,7 +152,8 @@ impl NubiClient {
         &self,
         room_id: &str,
         text: &str,
-        mentions: Vec<String>,
+        mut mentions: Vec<String>,
+        expect_reply: Option<Vec<String>>,
     ) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/messages",
@@ -160,16 +161,27 @@ impl NubiClient {
             room_id
         );
         let message_id = uuid::Uuid::new_v4().to_string();
-        self.request(
-            reqwest::Method::POST,
-            &path,
-            Some(json!({
-                "message_id": message_id,
-                "parts": [{ "kind": "text", "text": text }],
-                "mentions": mentions
-            })),
-        )
-        .await
+
+        // Someone named in expect_reply but not in mentions would never be
+        // delivered the message, so they could never reply.
+        if let Some(ref ids) = expect_reply {
+            for id in ids {
+                if !mentions.iter().any(|m| m == id) {
+                    mentions.push(id.clone());
+                }
+            }
+        }
+
+        let mut body = json!({
+            "message_id": message_id,
+            "parts": [{ "kind": "text", "text": text }],
+            "mentions": mentions
+        });
+        if let Some(ids) = expect_reply {
+            body["metadata"] = json!({ "expect_reply": ids });
+        }
+
+        self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
     async fn poll(
@@ -683,7 +695,16 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "room_id": { "type": "string" },
                         "text": { "type": "string" },
-                        "mentions": { "type": "array", "items": { "type": "string" } }
+                        "mentions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Agent ids who should see this message. Use 'here' for everyone in the room. Nobody reads a message they are not mentioned in."
+                        },
+                        "expect_reply": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Which of the mentioned agents should answer. Omit it and anyone mentioned may answer. Pass [] for read-only context nobody should reply to. Pass [\"apple\"] when you tag several people but only want apple to respond."
+                        }
                     },
                     "required": ["room_id", "text"]
                 }
@@ -797,7 +818,20 @@ async fn handle_tool_call(
                         .collect()
                 })
                 .unwrap_or_default();
-            client.send_message(room_id, text, mentions).await
+            // Absent must stay absent: collapsing it to an empty list would
+            // tell every receiver to stay quiet.
+            let expect_reply: Option<Vec<String>> = match args.get("expect_reply") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(arr)) => Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                ),
+                Some(_) => return Err("expect_reply must be an array of agent ids".to_string()),
+            };
+            client
+                .send_message(room_id, text, mentions, expect_reply)
+                .await
         }
         "nubi_poll" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -1198,6 +1232,86 @@ mod tests {
 
     type ResumeLog = Arc<Mutex<Vec<Option<String>>>>;
     type FlakyState = (ResumeLog, Arc<AtomicUsize>);
+    type SentBodies = Arc<Mutex<Vec<Value>>>;
+
+    /// Accepts message POSTs and records each body so the test can inspect
+    /// exactly what went on the wire.
+    async fn spawn_message_sink() -> (NubiClient, SentBodies) {
+        let sent: SentBodies = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/messages",
+                axum::routing::post(
+                    |State(sent): State<SentBodies>, axum::Json(body): axum::Json<Value>| async move {
+                        sent.lock().await.push(body);
+                        axum::Json(json!({ "ok": true }))
+                    },
+                ),
+            )
+            .with_state(sent.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config), sent)
+    }
+
+    #[tokio::test]
+    async fn send_without_expect_reply_sends_no_metadata() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message("r1", "hi", vec!["manager".into()], None)
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert!(
+            body.get("metadata").is_none(),
+            "absent expect_reply must not add metadata: {}",
+            body
+        );
+        assert_eq!(body["mentions"], json!(["manager"]));
+    }
+
+    #[tokio::test]
+    async fn send_with_empty_expect_reply_asks_nobody() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message("r1", "fyi", vec!["manager".into()], Some(vec![]))
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert_eq!(body["metadata"], json!({ "expect_reply": [] }));
+    }
+
+    #[tokio::test]
+    async fn send_adds_expect_reply_targets_to_mentions() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message(
+                "r1",
+                "take this",
+                vec!["manager".into()],
+                Some(vec!["apple".into()]),
+            )
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        // apple was never mentioned, so without the union it would never see
+        // the message it is being asked to answer.
+        assert_eq!(body["mentions"], json!(["manager", "apple"]));
+        assert_eq!(body["metadata"], json!({ "expect_reply": ["apple"] }));
+    }
 
     /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
     /// attempt so the test can assert the client resumes instead of restarting.
