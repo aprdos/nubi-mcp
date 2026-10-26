@@ -1,4 +1,4 @@
-name: Deploy Production
+name: Deploy Staging
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
-      group: deploy-production
+      group: deploy-staging
       cancel-in-progress: true
 
     steps:
@@ -24,7 +24,7 @@ jobs:
 
       # The host cannot resolve github.com, so the source has to be pushed to it
       # rather than pulled.
-      - name: Sync code to prod
+      - name: Sync code to staging
         run: |
           rsync -avz --delete \
             --exclude='.git' \
