@@ -261,21 +261,33 @@ impl NubiClient {
 
     async fn search(
         &self,
-        room_id: &str,
         query: &str,
-        from_index: Option<u64>,
+        room_ids: Option<Vec<String>>,
+        limit: Option<u64>,
+        cursor: Option<String>,
     ) -> Result<Value, String> {
-        let encoded_query = urlencoding(query);
-        let mut path = format!(
-            "/v1/spaces/{}/rooms/{}/search?q={}",
-            self.space_id().await,
-            room_id,
-            encoded_query
-        );
-        if let Some(idx) = from_index {
-            path = format!("{}&from_index={}", path, idx);
+        let path = format!("/v1/spaces/{}/search", self.space_id().await);
+
+        // Split query into terms (whitespace-separated)
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        if terms.is_empty() {
+            return Err("query cannot be empty".to_string());
         }
-        self.request(reqwest::Method::GET, &path, None).await
+
+        let mut body = json!({ "terms": terms });
+        if let Some(ids) = room_ids {
+            if !ids.is_empty() {
+                body["room_ids"] = json!(ids);
+            }
+        }
+        if let Some(l) = limit {
+            body["limit"] = json!(l);
+        }
+        if let Some(c) = cursor {
+            body["cursor"] = json!(c);
+        }
+
+        self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
     async fn list_agents(&self) -> Result<Value, String> {
@@ -309,22 +321,6 @@ impl NubiClient {
         let mut config = self.config.write().await;
         config.reload_token()
     }
-}
-
-fn urlencoding(s: &str) -> String {
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
-            ' ' => result.push_str("%20"),
-            _ => {
-                for b in c.to_string().as_bytes() {
-                    result.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-    }
-    result
 }
 
 // --- Subscription Manager ---
@@ -770,15 +766,17 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_search",
-                "description": "Search messages in a room",
+                "description": "Search messages across rooms. Returns matching messages with room context. Use for targeted retrieval instead of scrolling through history.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
-                        "query": { "type": "string" },
-                        "from_index": { "type": "number" }
+                        "query": { "type": "string", "description": "Search query. Multiple words are AND-ed together." },
+                        "room_id": { "type": "string", "description": "Single room to search. Use room_ids for multiple rooms." },
+                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Rooms to search. Omit to search all rooms you can read." },
+                        "limit": { "type": "number", "description": "Max results to return (default 50)." },
+                        "cursor": { "type": "string", "description": "Pagination cursor from previous response." }
                     },
-                    "required": ["room_id", "query"]
+                    "required": ["query"]
                 }
             },
             {
@@ -896,10 +894,20 @@ async fn handle_tool_call(
                 .await
         }
         "nubi_search" => {
-            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let query = args["query"].as_str().ok_or("query required")?;
-            let from_index = args["from_index"].as_u64();
-            client.search(room_id, query, from_index).await
+            // Support both single room_id and room_ids array
+            let room_ids: Option<Vec<String>> = match (args.get("room_ids"), args.get("room_id")) {
+                (Some(Value::Array(arr)), _) => Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                ),
+                (_, Some(Value::String(id))) => Some(vec![id.clone()]),
+                _ => None,
+            };
+            let limit = args["limit"].as_u64();
+            let cursor = args["cursor"].as_str().map(String::from);
+            client.search(query, room_ids, limit, cursor).await
         }
         "nubi_list_agents" => client.list_agents().await,
         "nubi_invite" => {
@@ -1565,5 +1573,87 @@ mod tests {
         );
         assert_eq!(startup_targets("r1, *"), vec![Target::Space]);
         assert_eq!(startup_targets(" , "), Vec::new());
+    }
+
+    /// Spawns a mock server that records search requests and returns a canned response.
+    async fn spawn_search_sink() -> (NubiClient, Arc<Mutex<Vec<Value>>>) {
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/search",
+                axum::routing::post(
+                    |State(reqs): State<Arc<Mutex<Vec<Value>>>>,
+                     axum::Json(body): axum::Json<Value>| async move {
+                        reqs.lock().await.push(body);
+                        axum::Json(json!({
+                            "results": [
+                                {
+                                    "room_id": "room-1",
+                                    "global_index": 42,
+                                    "sender": "alice",
+                                    "text": "found it",
+                                    "timestamp": "2026-10-28T10:00:00Z"
+                                }
+                            ],
+                            "has_more": false
+                        }))
+                    },
+                ),
+            )
+            .with_state(requests.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "test-space".into(),
+            agent_id: Some("me".into()),
+            token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config), requests)
+    }
+
+    #[tokio::test]
+    async fn search_posts_structured_payload() {
+        let (client, requests) = spawn_search_sink().await;
+        let result = client
+            .search("error timeout", Some(vec!["room-1".into(), "room-2".into()]), Some(25), None)
+            .await
+            .unwrap();
+
+        let req = &requests.lock().await[0];
+        assert_eq!(req["terms"], json!(["error", "timeout"]));
+        assert_eq!(req["room_ids"], json!(["room-1", "room-2"]));
+        assert_eq!(req["limit"], json!(25));
+        assert!(req.get("cursor").is_none());
+
+        assert_eq!(result["results"][0]["room_id"], "room-1");
+        assert_eq!(result["has_more"], false);
+    }
+
+    #[tokio::test]
+    async fn search_omits_room_ids_when_none() {
+        let (client, requests) = spawn_search_sink().await;
+        client.search("keyword", None, None, None).await.unwrap();
+
+        let req = &requests.lock().await[0];
+        assert_eq!(req["terms"], json!(["keyword"]));
+        assert!(req.get("room_ids").is_none());
+    }
+
+    #[tokio::test]
+    async fn search_includes_cursor_for_pagination() {
+        let (client, requests) = spawn_search_sink().await;
+        client
+            .search("query", None, None, Some("cursor123".into()))
+            .await
+            .unwrap();
+
+        let req = &requests.lock().await[0];
+        assert_eq!(req["cursor"], "cursor123");
     }
 }
