@@ -261,6 +261,46 @@ impl NubiClient {
 
     async fn search(
         &self,
+        room_ids: Option<Vec<&str>>,
+        query: &str,
+        from_index: Option<u64>,
+        limit: Option<u64>,
+        cursor: Option<&str>,
+    ) -> Result<Value, String> {
+        // Split query into terms (whitespace-separated)
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        if terms.is_empty() {
+            return Err("query cannot be empty".into());
+        }
+        if terms.len() > 10 {
+            return Err("max 10 search terms allowed".into());
+        }
+
+        let path = format!("/v1/spaces/{}/search", self.space_id().await);
+
+        let mut body = json!({
+            "terms": terms
+        });
+
+        if let Some(ids) = room_ids {
+            body["room_ids"] = json!(ids);
+        }
+        if let Some(idx) = from_index {
+            body["from_index"] = json!(idx);
+        }
+        if let Some(lim) = limit {
+            body["limit"] = json!(lim);
+        }
+        if let Some(cur) = cursor {
+            body["cursor"] = json!(cur);
+        }
+
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    /// Legacy single-room search for backward compatibility
+    async fn search_legacy(
+        &self,
         room_id: &str,
         query: &str,
         from_index: Option<u64>,
@@ -770,15 +810,18 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_search",
-                "description": "Search messages in a room",
+                "description": "Search messages across rooms. Returns matching messages with room context. Use for targeted retrieval instead of scrolling through history.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
-                        "query": { "type": "string" },
-                        "from_index": { "type": "number" }
+                        "room_id": { "type": "string", "description": "Single room to search. Use room_ids for multiple rooms." },
+                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Rooms to search. Omit to search all rooms you can read." },
+                        "query": { "type": "string", "description": "Search query. Multiple words are AND-ed together." },
+                        "from_index": { "type": "number", "description": "Only return messages after this global index." },
+                        "limit": { "type": "number", "description": "Max results to return (default 50, max 100)." },
+                        "cursor": { "type": "string", "description": "Pagination cursor from previous response." }
                     },
-                    "required": ["room_id", "query"]
+                    "required": ["query"]
                 }
             },
             {
@@ -896,10 +939,21 @@ async fn handle_tool_call(
                 .await
         }
         "nubi_search" => {
-            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let query = args["query"].as_str().ok_or("query required")?;
             let from_index = args["from_index"].as_u64();
-            client.search(room_id, query, from_index).await
+            let limit = args["limit"].as_u64();
+            let cursor = args["cursor"].as_str();
+
+            // Collect room_ids from either room_id (single) or room_ids (array)
+            let room_ids: Option<Vec<&str>> = if let Some(arr) = args["room_ids"].as_array() {
+                Some(arr.iter().filter_map(|v| v.as_str()).collect())
+            } else if let Some(single) = args["room_id"].as_str() {
+                Some(vec![single])
+            } else {
+                None
+            };
+
+            client.search(room_ids, query, from_index, limit, cursor).await
         }
         "nubi_list_agents" => client.list_agents().await,
         "nubi_invite" => {
@@ -1565,5 +1619,100 @@ mod tests {
         );
         assert_eq!(startup_targets("r1, *"), vec![Target::Space]);
         assert_eq!(startup_targets(" , "), Vec::new());
+    }
+
+    /// Spawn a mock server that accepts search POST requests and records the body
+    async fn spawn_search_sink() -> (NubiClient, SentBodies) {
+        let sent: SentBodies = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/search",
+                axum::routing::post(
+                    |State(sent): State<SentBodies>, axum::Json(body): axum::Json<Value>| async move {
+                        sent.lock().await.push(body);
+                        axum::Json(json!({
+                            "results": [
+                                {
+                                    "room_id": "room-123",
+                                    "global_index": 456,
+                                    "sender": "alice",
+                                    "text": "error timeout on deploy",
+                                    "timestamp": "2026-10-28T10:30:00Z"
+                                }
+                            ],
+                            "cursor": null,
+                            "has_more": false,
+                            "rooms_searched": 1,
+                            "rooms_remaining": 0
+                        }))
+                    },
+                ),
+            )
+            .with_state(sent.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: Some("me".into()),
+            token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config), sent)
+    }
+
+    #[tokio::test]
+    async fn search_sends_structured_post_request() {
+        let (client, sent) = spawn_search_sink().await;
+        client
+            .search(
+                Some(vec!["room-1", "room-2"]),
+                "error timeout",
+                None,
+                Some(50),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert_eq!(body["terms"], json!(["error", "timeout"]));
+        assert_eq!(body["room_ids"], json!(["room-1", "room-2"]));
+        assert_eq!(body["limit"], json!(50));
+    }
+
+    #[tokio::test]
+    async fn search_without_room_ids_omits_field() {
+        let (client, sent) = spawn_search_sink().await;
+        client
+            .search(None, "keyword", None, None, None)
+            .await
+            .unwrap();
+
+        let body = &sent.lock().await[0];
+        assert_eq!(body["terms"], json!(["keyword"]));
+        assert!(body.get("room_ids").is_none(), "room_ids should be omitted when None");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_empty_query() {
+        let (client, _) = spawn_search_sink().await;
+        let result = client.search(None, "   ", None, None, None).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "query cannot be empty");
+    }
+
+    #[tokio::test]
+    async fn search_rejects_too_many_terms() {
+        let (client, _) = spawn_search_sink().await;
+        let result = client
+            .search(None, "a b c d e f g h i j k", None, None, None)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "max 10 search terms allowed");
     }
 }
