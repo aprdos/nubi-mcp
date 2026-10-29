@@ -163,6 +163,15 @@ impl NubiClient {
         self.list_rooms(Some("skill")).await
     }
 
+    async fn get_skill_prompt(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/skills/{}/prompt",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
     async fn get_room(&self, room_id: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms/{}", self.space_id().await, room_id);
         self.request(reqwest::Method::GET, &path, None).await
@@ -731,6 +740,15 @@ fn tools_list_full() -> Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
+                "name": "nubi_get_skill",
+                "description": "Get a skill's content/prompt. Returns the full skill definition ready to save to .claude/skills/",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string", "description": "The skill room id" } },
+                    "required": ["room_id"]
+                }
+            },
+            {
                 "name": "nubi_get_room",
                 "description": "Get room details including members",
                 "inputSchema": {
@@ -882,6 +900,10 @@ async fn handle_tool_call(
     match name {
         "nubi_list_rooms" => client.list_rooms(None).await,
         "nubi_list_skills" => client.list_skills().await,
+        "nubi_get_skill" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.get_skill_prompt(room_id).await
+        }
         "nubi_get_room" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_room(room_id).await
