@@ -317,6 +317,25 @@ impl NubiClient {
         .await
     }
 
+    async fn create_thread(
+        &self,
+        room_id: &str,
+        message_index: u64,
+        name: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/messages/{}/thread",
+            self.space_id().await,
+            urlencoding::encode(room_id),
+            message_index
+        );
+        let body = match name {
+            Some(n) => json!({ "name": n }),
+            None => json!({}),
+        };
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
     async fn reload_token(&self) -> Result<(), String> {
         let mut config = self.config.write().await;
         config.reload_token()
@@ -819,6 +838,19 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_create_thread",
+                "description": "Create a thread on a message. Returns the thread room which you can then send messages to.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The room containing the message" },
+                        "message_index": { "type": "number", "description": "The global index of the message to start a thread on" },
+                        "name": { "type": "string", "description": "Optional thread name" }
+                    },
+                    "required": ["room_id", "message_index"]
+                }
+            },
+            {
                 "name": "nubi_reload",
                 "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -915,6 +947,14 @@ async fn handle_tool_call(
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
             let role = args["role"].as_str().unwrap_or("member");
             client.invite_member(room_id, agent_id, role).await
+        }
+        "nubi_create_thread" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let message_index = args["message_index"]
+                .as_u64()
+                .ok_or("message_index required")?;
+            let name = args["name"].as_str();
+            client.create_thread(room_id, message_index, name).await
         }
         "nubi_reload" => {
             client.reload_token().await?;
@@ -1621,7 +1661,12 @@ mod tests {
     async fn search_posts_structured_payload() {
         let (client, requests) = spawn_search_sink().await;
         let result = client
-            .search("error timeout", Some(vec!["room-1".into(), "room-2".into()]), Some(25), None)
+            .search(
+                "error timeout",
+                Some(vec!["room-1".into(), "room-2".into()]),
+                Some(25),
+                None,
+            )
             .await
             .unwrap();
 
