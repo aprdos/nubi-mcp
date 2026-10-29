@@ -326,7 +326,7 @@ impl NubiClient {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/messages/{}/thread",
             self.space_id().await,
-            room_id,
+            urlencoding::encode(room_id),
             message_index
         );
         let body = match name {
