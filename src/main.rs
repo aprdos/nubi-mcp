@@ -167,7 +167,7 @@ impl NubiClient {
         let path = format!(
             "/v1/spaces/{}/skills/{}/prompt",
             self.space_id().await,
-            room_id
+            urlencoding::encode(room_id)
         );
         self.request(reqwest::Method::GET, &path, None).await
     }
