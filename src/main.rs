@@ -1661,7 +1661,12 @@ mod tests {
     async fn search_posts_structured_payload() {
         let (client, requests) = spawn_search_sink().await;
         let result = client
-            .search("error timeout", Some(vec!["room-1".into(), "room-2".into()]), Some(25), None)
+            .search(
+                "error timeout",
+                Some(vec!["room-1".into(), "room-2".into()]),
+                Some(25),
+                None,
+            )
             .await
             .unwrap();
 
