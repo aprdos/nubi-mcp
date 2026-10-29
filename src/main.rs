@@ -77,6 +77,157 @@ impl Config {
     }
 }
 
+// --- Skills ---
+
+#[derive(Clone, Debug)]
+struct SkillMeta {
+    name: String,
+    description: String,
+    triggers: Vec<String>,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SkillRegistry {
+    skills: HashMap<String, SkillMeta>,
+}
+
+impl SkillRegistry {
+    /// Load skills from both shared and per-agent directories.
+    /// Per-agent skills override shared skills with the same name.
+    fn load(agent_id: Option<&str>) -> Self {
+        let mut registry = Self::default();
+        let home = match std::env::var("HOME") {
+            Ok(h) => PathBuf::from(h),
+            Err(_) => return registry,
+        };
+
+        // Load shared skills first (lower priority)
+        let shared_dir = home.join(".nubi/skills");
+        registry.load_from_dir(&shared_dir);
+
+        // Load per-agent skills (higher priority, overwrites shared)
+        if let Some(id) = agent_id {
+            let agent_dir = home.join(format!(".nubi-agents/{}/skills", id));
+            registry.load_from_dir(&agent_dir);
+        }
+
+        registry
+    }
+
+    fn load_from_dir(&mut self, dir: &PathBuf) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return, // Directory doesn't exist, skip gracefully
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                if let Some(skill) = Self::parse_skill_file(&path) {
+                    self.skills.insert(skill.name.clone(), skill);
+                }
+            }
+        }
+    }
+
+    fn parse_skill_file(path: &PathBuf) -> Option<SkillMeta> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let (frontmatter, _) = Self::split_frontmatter(&content)?;
+
+        let name = Self::extract_field(&frontmatter, "name")?;
+        let description = Self::extract_field(&frontmatter, "description")?;
+        let triggers = Self::extract_array(&frontmatter, "triggers").unwrap_or_default();
+
+        Some(SkillMeta {
+            name,
+            description,
+            triggers,
+            path: path.clone(),
+        })
+    }
+
+    fn split_frontmatter(content: &str) -> Option<(String, String)> {
+        let content = content.trim_start();
+        if !content.starts_with("---") {
+            return None;
+        }
+        let after_first = &content[3..];
+        let end_pos = after_first.find("\n---")?;
+        let frontmatter = after_first[..end_pos].trim().to_string();
+        let body = after_first[end_pos + 4..].trim().to_string();
+        Some((frontmatter, body))
+    }
+
+    fn extract_field(yaml: &str, field: &str) -> Option<String> {
+        for line in yaml.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix(&format!("{}:", field)) {
+                let value = rest.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_array(yaml: &str, field: &str) -> Option<Vec<String>> {
+        let mut in_array = false;
+        let mut values = Vec::new();
+
+        for line in yaml.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with(&format!("{}:", field)) {
+                in_array = true;
+                continue;
+            }
+            if in_array {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    values.push(item.trim().trim_matches('"').trim_matches('\'').to_string());
+                } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
+                    break; // Next field
+                }
+            }
+        }
+
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    }
+
+    fn get_content(&self, name: &str) -> Result<Value, String> {
+        let skill = self.skills.get(name).ok_or("skill_not_found")?;
+        let content = std::fs::read_to_string(&skill.path)
+            .map_err(|e| format!("failed to read skill file: {}", e))?;
+
+        let body = Self::split_frontmatter(&content)
+            .map(|(_, b)| b)
+            .unwrap_or(content);
+
+        Ok(json!({
+            "name": skill.name,
+            "description": skill.description,
+            "source": skill.path.to_string_lossy(),
+            "content": body
+        }))
+    }
+
+    fn list_for_prompt(&self) -> String {
+        if self.skills.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = vec!["\n\nAvailable skills:".to_string()];
+        for skill in self.skills.values() {
+            lines.push(format!("- {}: {}", skill.name, skill.description));
+        }
+        lines.join("\n")
+    }
+}
+
 // --- Nubi Client ---
 
 /// Mention ids arrive as the model typed them, so `@Manager ` and `manager`
@@ -663,7 +814,11 @@ fn negotiate_version(params: &Value) -> String {
     }
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(params: &Value, skills: &SkillRegistry) -> Value {
+    let base_instructions = "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages.";
+    let skills_list = skills.list_for_prompt();
+    let instructions = format!("{}{}", base_instructions, skills_list);
+
     json!({
         "protocolVersion": negotiate_version(params),
         "capabilities": {
@@ -673,7 +828,7 @@ fn initialize_result(params: &Value) -> Value {
             }
         },
         "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" },
-        "instructions": "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages."
+        "instructions": instructions
     })
 }
 
@@ -822,6 +977,22 @@ fn tools_list_full() -> Value {
                 "name": "nubi_reload",
                 "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "nubi_skill_invoke",
+                "description": "Invoke a skill by name. Returns the full skill content to follow.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "skill": { "type": "string", "description": "Name of the skill to invoke" }
+                    },
+                    "required": ["skill"]
+                }
+            },
+            {
+                "name": "nubi_skill_list",
+                "description": "List all available skills with their descriptions.",
+                "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
@@ -834,6 +1005,7 @@ async fn handle_tool_call(
     config: &Arc<RwLock<Config>>,
     subscriptions: &Subscriptions,
     notify_tx: &mpsc::UnboundedSender<Value>,
+    skills: &SkillRegistry,
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => client.list_rooms().await,
@@ -950,6 +1122,25 @@ async fn handle_tool_call(
                 Ok(json!({ "status": "not_subscribed", "room_id": room_id }))
             }
         }
+        "nubi_skill_invoke" => {
+            let skill_name = args["skill"].as_str().ok_or("skill required")?;
+            skills.get_content(skill_name)
+        }
+        "nubi_skill_list" => {
+            let list: Vec<Value> = skills
+                .skills
+                .values()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "description": s.description,
+                        "triggers": s.triggers,
+                        "source": s.path.to_string_lossy()
+                    })
+                })
+                .collect();
+            Ok(json!({ "skills": list }))
+        }
         _ => Err(format!("unknown tool: {}", name)),
     }
 }
@@ -960,16 +1151,17 @@ async fn handle_request(
     config: &Arc<RwLock<Config>>,
     subscriptions: &Subscriptions,
     notify_tx: &mpsc::UnboundedSender<Value>,
+    skills: &SkillRegistry,
 ) -> Option<JsonRpcResponse> {
     let result = match req.method.as_str() {
-        "initialize" => Ok(initialize_result(&req.params)),
+        "initialize" => Ok(initialize_result(&req.params, skills)),
         "notifications/initialized" => return None,
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list(false)),
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
             let args = &req.params["arguments"];
-            match handle_tool_call(client, name, args, config, subscriptions, notify_tx).await {
+            match handle_tool_call(client, name, args, config, subscriptions, notify_tx, skills).await {
                 Ok(v) => Ok(json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }]
                 })),
@@ -1093,8 +1285,15 @@ async fn handle_http_request(
     token: &str,
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
+    // For hosted mode, we need agent_id to load skills. Resolve it early if needed.
+    let me = match req.method.as_str() {
+        "initialize" | "tools/call" => resolve_me(state, token).await.ok(),
+        _ => None,
+    };
+    let skills = SkillRegistry::load(me.as_ref().map(|m| m.agent_id.as_str()));
+
     match req.method.as_str() {
-        "initialize" => rpc_ok(req.id, initialize_result(&req.params)),
+        "initialize" => rpc_ok(req.id, initialize_result(&req.params, &skills)),
         "ping" => rpc_ok(req.id, json!({})),
         "tools/list" => rpc_ok(req.id, tools_list(true)),
         "tools/call" => {
@@ -1108,9 +1307,12 @@ async fn handle_http_request(
                 ));
             }
 
-            let me = match resolve_me(state, token).await {
-                Ok(m) => m,
-                Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
+            let me = match me {
+                Some(m) => m,
+                None => match resolve_me(state, token).await {
+                    Ok(m) => m,
+                    Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
+                },
             };
 
             let config = Arc::new(RwLock::new(Config {
@@ -1128,7 +1330,7 @@ async fn handle_http_request(
             let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
             let (notify_tx, _notify_rx) = mpsc::unbounded_channel::<Value>();
 
-            match handle_tool_call(&client, name, args, &config, &subscriptions, &notify_tx).await {
+            match handle_tool_call(&client, name, args, &config, &subscriptions, &notify_tx, &skills).await {
                 Ok(v) => rpc_ok(
                     req.id,
                     tool_text_result(serde_json::to_string_pretty(&v).unwrap(), false),
@@ -1243,6 +1445,13 @@ async fn main() {
     let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
     let (notify_tx, mut notify_rx) = mpsc::unbounded_channel::<Value>();
 
+    // Resolve agent_id early so we can load per-agent skills
+    let agent_id = client.self_id().await;
+    let skills = SkillRegistry::load(agent_id.as_deref());
+    if !skills.skills.is_empty() {
+        eprintln!("nubi: loaded {} skill(s)", skills.skills.len());
+    }
+
     // Open the configured subscriptions up front, so push does not depend on
     // the model remembering to call nubi_subscribe. Mentions only: an unfiltered
     // stream wakes the model for every message in every joined room, which is
@@ -1286,7 +1495,7 @@ async fn main() {
             }
         };
 
-        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx).await
+        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx, &skills).await
         {
             let out = serde_json::to_string(&resp).unwrap();
             writeln!(stdout, "{}", out).unwrap();
