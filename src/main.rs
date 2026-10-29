@@ -154,7 +154,7 @@ impl NubiClient {
     async fn list_rooms(&self, kind: Option<&str>) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         if let Some(k) = kind {
-            path = format!("{}?kind={}", path, k);
+            path = format!("{}?kind={}", path, urlencoding::encode(k));
         }
         self.request(reqwest::Method::GET, &path, None).await
     }
@@ -727,7 +727,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_list_skills",
-                "description": "List all skills in the space",
+                "description": "List skills you have access to",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
