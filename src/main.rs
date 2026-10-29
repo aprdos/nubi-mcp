@@ -199,7 +199,10 @@ impl SkillRegistry {
     }
 
     fn get_content(&self, name: &str) -> Result<Value, String> {
-        let skill = self.skills.get(name).ok_or("skill_not_found")?;
+        let skill = self
+            .skills
+            .get(name)
+            .ok_or_else(|| format!("skill not found: {}", name))?;
         let content = std::fs::read_to_string(&skill.path)
             .map_err(|e| format!("failed to read skill file: {}", e))?;
 
@@ -220,8 +223,11 @@ impl SkillRegistry {
             return String::new();
         }
 
+        let mut skills: Vec<_> = self.skills.values().collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+
         let mut lines = vec!["\n\nAvailable skills:".to_string()];
-        for skill in self.skills.values() {
+        for skill in skills {
             lines.push(format!("- {}: {}", skill.name, skill.description));
         }
         lines.join("\n")
@@ -1127,9 +1133,10 @@ async fn handle_tool_call(
             skills.get_content(skill_name)
         }
         "nubi_skill_list" => {
+            let mut skills: Vec<_> = skills.skills.values().collect();
+            skills.sort_by(|a, b| a.name.cmp(&b.name));
             let list: Vec<Value> = skills
-                .skills
-                .values()
+                .into_iter()
                 .map(|s| {
                     json!({
                         "name": s.name,
@@ -1161,7 +1168,9 @@ async fn handle_request(
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
             let args = &req.params["arguments"];
-            match handle_tool_call(client, name, args, config, subscriptions, notify_tx, skills).await {
+            match handle_tool_call(client, name, args, config, subscriptions, notify_tx, skills)
+                .await
+            {
                 Ok(v) => Ok(json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }]
                 })),
@@ -1203,6 +1212,8 @@ struct HttpState {
     /// Only successfully authenticated tokens are cached, so size is
     /// bounded by the number of valid keys in the engine.
     me_cache: Arc<RwLock<HashMap<String, Me>>>,
+    /// agent_id -> skills registry, loaded once per agent.
+    skills_cache: Arc<RwLock<HashMap<String, SkillRegistry>>>,
 }
 
 #[derive(Clone)]
@@ -1290,7 +1301,25 @@ async fn handle_http_request(
         "initialize" | "tools/call" => resolve_me(state, token).await.ok(),
         _ => None,
     };
-    let skills = SkillRegistry::load(me.as_ref().map(|m| m.agent_id.as_str()));
+
+    // Load skills from cache or disk (once per agent)
+    let skills = if let Some(ref m) = me {
+        let cache = state.skills_cache.read().await;
+        if let Some(s) = cache.get(&m.agent_id) {
+            s.clone()
+        } else {
+            drop(cache);
+            let loaded = SkillRegistry::load(Some(&m.agent_id));
+            state
+                .skills_cache
+                .write()
+                .await
+                .insert(m.agent_id.clone(), loaded.clone());
+            loaded
+        }
+    } else {
+        SkillRegistry::default()
+    };
 
     match req.method.as_str() {
         "initialize" => rpc_ok(req.id, initialize_result(&req.params, &skills)),
@@ -1311,7 +1340,9 @@ async fn handle_http_request(
                 Some(m) => m,
                 None => match resolve_me(state, token).await {
                     Ok(m) => m,
-                    Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
+                    Err(e) => {
+                        return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true))
+                    }
                 },
             };
 
@@ -1330,7 +1361,17 @@ async fn handle_http_request(
             let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
             let (notify_tx, _notify_rx) = mpsc::unbounded_channel::<Value>();
 
-            match handle_tool_call(&client, name, args, &config, &subscriptions, &notify_tx, &skills).await {
+            match handle_tool_call(
+                &client,
+                name,
+                args,
+                &config,
+                &subscriptions,
+                &notify_tx,
+                &skills,
+            )
+            .await
+            {
                 Ok(v) => rpc_ok(
                     req.id,
                     tool_text_result(serde_json::to_string_pretty(&v).unwrap(), false),
@@ -1392,6 +1433,7 @@ async fn run_http(addr: SocketAddr) {
         base_url: base_url.clone(),
         http: reqwest::Client::new(),
         me_cache: Arc::new(RwLock::new(HashMap::new())),
+        skills_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let app = axum::Router::new()
@@ -1495,7 +1537,8 @@ async fn main() {
             }
         };
 
-        if let Some(resp) = handle_request(&client, req, &config, &subscriptions, &notify_tx, &skills).await
+        if let Some(resp) =
+            handle_request(&client, req, &config, &subscriptions, &notify_tx, &skills).await
         {
             let out = serde_json::to_string(&resp).unwrap();
             writeln!(stdout, "{}", out).unwrap();
@@ -1830,7 +1873,12 @@ mod tests {
     async fn search_posts_structured_payload() {
         let (client, requests) = spawn_search_sink().await;
         let result = client
-            .search("error timeout", Some(vec!["room-1".into(), "room-2".into()]), Some(25), None)
+            .search(
+                "error timeout",
+                Some(vec!["room-1".into(), "room-2".into()]),
+                Some(25),
+                None,
+            )
             .await
             .unwrap();
 
