@@ -107,12 +107,26 @@ impl SkillRegistry {
         registry.load_from_dir(&shared_dir);
 
         // Load per-agent skills (higher priority, overwrites shared)
+        // Sanitize agent_id to prevent path traversal (CWE-22)
         if let Some(id) = agent_id {
-            let agent_dir = home.join(format!(".nubi-agents/{}/skills", id));
-            registry.load_from_dir(&agent_dir);
+            if Self::is_safe_path_segment(id) {
+                let agent_dir = home.join(format!(".nubi-agents/{}/skills", id));
+                registry.load_from_dir(&agent_dir);
+            }
         }
 
         registry
+    }
+
+    /// Check if a string is safe to use as a path segment (no traversal)
+    fn is_safe_path_segment(s: &str) -> bool {
+        !s.is_empty()
+            && !s.contains('/')
+            && !s.contains('\\')
+            && !s.contains('\0')
+            && s != "."
+            && s != ".."
+            && !s.starts_with("..")
     }
 
     fn load_from_dir(&mut self, dir: &PathBuf) {
@@ -155,7 +169,12 @@ impl SkillRegistry {
         let after_first = &content[3..];
         let end_pos = after_first.find("\n---")?;
         let frontmatter = after_first[..end_pos].trim().to_string();
-        let body = after_first[end_pos + 4..].trim().to_string();
+        // Handle edge case where file ends exactly at "\n---" with no trailing content
+        let body = if end_pos + 4 <= after_first.len() {
+            after_first[end_pos + 4..].trim().to_string()
+        } else {
+            String::new()
+        };
         Some((frontmatter, body))
     }
 
@@ -210,10 +229,10 @@ impl SkillRegistry {
             .map(|(_, b)| b)
             .unwrap_or(content);
 
+        // Note: source path intentionally omitted to prevent path disclosure (CWE-200)
         Ok(json!({
             "name": skill.name,
             "description": skill.description,
-            "source": skill.path.to_string_lossy(),
             "content": body
         }))
     }
@@ -1135,14 +1154,14 @@ async fn handle_tool_call(
         "nubi_skill_list" => {
             let mut skills: Vec<_> = skills.skills.values().collect();
             skills.sort_by(|a, b| a.name.cmp(&b.name));
+            // Note: source path intentionally omitted to prevent path disclosure (CWE-200)
             let list: Vec<Value> = skills
                 .into_iter()
                 .map(|s| {
                     json!({
                         "name": s.name,
                         "description": s.description,
-                        "triggers": s.triggers,
-                        "source": s.path.to_string_lossy()
+                        "triggers": s.triggers
                     })
                 })
                 .collect();
