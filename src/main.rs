@@ -86,6 +86,24 @@ fn same_agent(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// Keeps only skill rooms (and, given a status, only skills in that status).
+///
+/// A room's kind is an object tagged by `type` (`{"type": "skill", "status":
+/// "published", ...}`), not a bare string, so comparing `kind` itself to
+/// `"skill"` never matches.
+fn filter_skill_rooms(rooms: Value, status: Option<&str>) -> Value {
+    let Value::Array(rooms) = rooms else {
+        return rooms;
+    };
+    Value::Array(
+        rooms
+            .into_iter()
+            .filter(|r| r["kind"]["type"].as_str() == Some("skill"))
+            .filter(|r| status.is_none_or(|s| r["kind"]["status"].as_str() == Some(s)))
+            .collect(),
+    )
+}
+
 struct NubiClient {
     config: Arc<RwLock<Config>>,
     http: reqwest::Client,
@@ -159,8 +177,19 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn list_skills(&self) -> Result<Value, String> {
-        self.list_rooms(Some("skill")).await
+    /// Skill rooms the caller belongs to, optionally narrowed by status.
+    ///
+    /// The engine filters on `kind` and `status` itself, but an engine that
+    /// predates either filter ignores the query string and returns every room,
+    /// so the result is filtered again here on the room's `kind.type` and
+    /// `kind.status`.
+    async fn list_skills(&self, status: Option<&str>) -> Result<Value, String> {
+        let mut path = format!("/v1/spaces/{}/rooms?kind=skill", self.space_id().await);
+        if let Some(s) = status {
+            path = format!("{}&status={}", path, urlencoding::encode(s));
+        }
+        let rooms = self.request(reqwest::Method::GET, &path, None).await?;
+        Ok(filter_skill_rooms(rooms, status))
     }
 
     async fn get_skill_prompt(&self, room_id: &str) -> Result<Value, String> {
@@ -737,7 +766,12 @@ fn tools_list_full() -> Value {
             {
                 "name": "nubi_list_skills",
                 "description": "List skills you have access to",
-                "inputSchema": { "type": "object", "properties": {} }
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skills in this status" }
+                    }
+                }
             },
             {
                 "name": "nubi_get_skill",
@@ -899,7 +933,7 @@ async fn handle_tool_call(
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => client.list_rooms(None).await,
-        "nubi_list_skills" => client.list_skills().await,
+        "nubi_list_skills" => client.list_skills(args["status"].as_str()).await,
         "nubi_get_skill" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_skill_prompt(room_id).await
@@ -1735,5 +1769,66 @@ mod tests {
 
         let req = &requests.lock().await[0];
         assert_eq!(req["cursor"], "cursor123");
+    }
+
+    /// An engine that ignores `?kind=` and `?status=` and returns every room,
+    /// recording the query string it was asked for.
+    async fn spawn_unfiltered_rooms() -> (NubiClient, Arc<Mutex<Vec<String>>>) {
+        let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/rooms",
+                get(
+                    |State(q): State<Arc<Mutex<Vec<String>>>>, uri: axum::http::Uri| async move {
+                        q.lock().await.push(uri.query().unwrap_or("").to_string());
+                        axum::Json(json!([
+                            { "id": "g1", "name": "general", "kind": { "type": "group" } },
+                            { "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } },
+                            { "id": "s2", "name": "Tone", "kind": { "type": "skill", "status": "draft" } },
+                            { "id": "t1", "name": "task", "kind": { "type": "task", "status": "published" } }
+                        ]))
+                    },
+                ),
+            )
+            .with_state(queries.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: Some("me".into()),
+            token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config), queries)
+    }
+
+    #[tokio::test]
+    async fn list_skills_matches_on_kind_type() {
+        let (client, queries) = spawn_unfiltered_rooms().await;
+        let skills = client.list_skills(None).await.unwrap();
+        let ids: Vec<&str> = skills
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        // `kind` is an object; the old filter compared it to "skill" and
+        // returned nothing.
+        assert_eq!(ids, vec!["s1", "s2"]);
+        assert_eq!(queries.lock().await[0], "kind=skill");
+    }
+
+    #[tokio::test]
+    async fn list_skills_filters_by_status() {
+        let (client, queries) = spawn_unfiltered_rooms().await;
+        let skills = client.list_skills(Some("published")).await.unwrap();
+        assert_eq!(
+            skills,
+            json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
+        );
+        assert_eq!(queries.lock().await[0], "kind=skill&status=published");
     }
 }

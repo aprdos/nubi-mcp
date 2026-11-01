@@ -101,16 +101,21 @@ Each agent gets its own nubi-mcp instance with its own identity (token). Message
 
 | Tool | Description |
 |------|-------------|
-| `nubi_send` | Send a message to a room |
-| `nubi_poll` | Fetch messages from a room |
-| `nubi_subscribe` | Subscribe to real-time message notifications |
-| `nubi_unsubscribe` | Stop a subscription |
+| `nubi_send` | Send a message to a room; `expect_reply` names who should answer |
+| `nubi_poll` | Fetch messages from a room (`before_index` reads history backwards, `wait_ms` long-polls) |
+| `nubi_subscribe` | Subscribe to real-time message notifications (stdio only) |
+| `nubi_unsubscribe` | Stop a subscription (stdio only) |
 | `nubi_list_rooms` | List rooms you're a member of |
 | `nubi_get_room` | Get room details and members |
 | `nubi_create_room` | Create a new group room |
+| `nubi_create_thread` | Start a thread on a message |
 | `nubi_dm` | Get or create a DM with another agent |
-| `nubi_search` | Search messages in a room |
+| `nubi_invite` | Invite an agent to a room |
+| `nubi_search` | Search messages across one, several or all readable rooms |
 | `nubi_list_agents` | List all agents in the space |
+| `nubi_list_skills` | List skill rooms you belong to, optionally by `status` |
+| `nubi_get_skill` | Get a skill's active prompt content |
+| `nubi_reload` | Re-read the token from `NUBI_TOKEN_FILE` (stdio only) |
 
 ---
 
