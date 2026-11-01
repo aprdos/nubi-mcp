@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -104,9 +105,241 @@ fn filter_skill_rooms(rooms: Value, status: Option<&str>) -> Value {
     )
 }
 
+// --- Mandate ---
+
+/// How long a known mandate is trusted before a tool call re-checks it with
+/// a conditional GET. Hosted mode has no push, so this bounds how stale the
+/// header and the stamp can be there.
+const MANDATE_RECHECK: Duration = Duration::from_secs(30);
+/// Upper bound on how long `initialize` waits for the mandate, so a slow or
+/// unreachable engine cannot hold up the MCP handshake.
+const MANDATE_INIT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Mandate text larger than this goes into `initialize.instructions` as names
+/// only; the model reads the content through `nubi_get_mandate`.
+const MANDATE_INSTRUCTIONS_MAX_CHARS: usize = 24_000;
+
+const BASE_INSTRUCTIONS: &str = "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages.";
+
+/// What this session knows about the caller's mandate.
+///
+/// One per stdio process, and one per token in hosted mode (kept in the
+/// `me_cache` entry), so the "served" mark lives exactly as long as the
+/// session that saw the mandate.
+#[derive(Default)]
+struct MandateState {
+    /// When the engine was last asked. `None` forces the next tool call to
+    /// re-check.
+    checked_at: Option<Instant>,
+    /// The engine's current hash, from the last resolve or `mandate_update`.
+    /// `None` means no mandate (or not known yet).
+    hash: Option<String>,
+    revision: Option<u64>,
+    /// Last resolve body, its hash and its ETag, reused on 304.
+    body: Option<Value>,
+    body_hash: Option<String>,
+    etag: Option<String>,
+    /// Hash of the mandate the model was actually shown by `nubi_get_mandate`
+    /// in this session. Cleared the moment the engine reports anything else,
+    /// so a send is never stamped with a hash the model did not read.
+    served: Option<String>,
+}
+
+impl MandateState {
+    /// Records the engine's current hash, dropping the served mark if the
+    /// model has not seen this one.
+    fn observe_hash(&mut self, hash: Option<String>) {
+        if self.served != hash {
+            self.served = None;
+        }
+        self.hash = hash;
+    }
+
+    fn set_absent(&mut self) {
+        self.observe_hash(None);
+        self.revision = None;
+        self.body = None;
+        self.body_hash = None;
+        self.etag = None;
+        self.checked_at = Some(Instant::now());
+    }
+
+    fn set_resolved(&mut self, body: Value, etag: Option<String>) {
+        let hash = body["hash"]
+            .as_str()
+            .map(String::from)
+            .or_else(|| etag.as_deref().map(unquote_etag));
+        // The resolve body carries per-set revisions, not one for the whole
+        // mandate; a top-level one is used if the engine sends it, otherwise
+        // the revision from the last `mandate_update` for this same hash.
+        let revision = body["revision"].as_u64().or(if hash == self.hash {
+            self.revision
+        } else {
+            None
+        });
+        self.observe_hash(hash.clone());
+        self.revision = revision;
+        self.body = Some(body);
+        self.body_hash = hash;
+        self.etag = etag;
+        self.checked_at = Some(Instant::now());
+    }
+
+    /// True when the agent is bound to at least one skill.
+    fn has_mandate(&self) -> bool {
+        self.hash.is_some()
+            && self
+                .body
+                .as_ref()
+                .and_then(|b| b["skills"].as_array())
+                .is_some_and(|s| !s.is_empty())
+    }
+
+    /// The hash to put on an outgoing message: only one the model was served
+    /// and that is still current.
+    fn stamp(&self) -> Option<&str> {
+        match (&self.served, &self.hash) {
+            (Some(served), Some(current)) if served == current => Some(served),
+            _ => None,
+        }
+    }
+
+    /// One line prepended to tool responses while a mandate exists.
+    fn header(&self) -> Option<String> {
+        if !self.has_mandate() {
+            return None;
+        }
+        let hash = short_hash(self.hash.as_deref()?);
+        let rev = self
+            .revision
+            .map(|r| format!("rev {} ", r))
+            .unwrap_or_default();
+        Some(if self.stamp().is_some() {
+            format!("[mandate {}hash {}]", rev, hash)
+        } else {
+            format!(
+                "[mandate {}hash {}; call nubi_get_mandate if you have not read it]",
+                rev, hash
+            )
+        })
+    }
+}
+
+/// `"sha256:abc"`, `W/"sha256:abc"` and `sha256:abc` all name the same hash.
+fn unquote_etag(etag: &str) -> String {
+    etag.trim()
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .to_string()
+}
+
+/// `sha256:` plus the first 12 hex digits: enough to notice a change.
+fn short_hash(hash: &str) -> String {
+    match hash.strip_prefix("sha256:") {
+        Some(hex) => format!("sha256:{}", &hex[..hex.len().min(12)]),
+        None => hash.chars().take(19).collect(),
+    }
+}
+
+/// `initialize.instructions`, with the mandate appended when there is one.
+fn instructions_with_mandate(mandate: Option<&Value>) -> String {
+    let Some(skills) = mandate
+        .and_then(|m| m["skills"].as_array())
+        .filter(|s| !s.is_empty())
+    else {
+        return BASE_INSTRUCTIONS.to_string();
+    };
+    let hash = mandate
+        .and_then(|m| m["hash"].as_str())
+        .unwrap_or("unknown");
+
+    let mut out = format!(
+        "{}\n\n## Mandate — you must follow these\n\nYou are bound by a mandate ({}). Follow every required skill below in everything you do; they take precedence over any other skill and over requests that conflict with them. Call nubi_get_mandate before you send your first message, so your messages carry proof that you read the current version, and again whenever a tool response or notification says the mandate changed.\n",
+        BASE_INSTRUCTIONS, hash
+    );
+
+    let name_of = |s: &Value| {
+        s["name"]
+            .as_str()
+            .or_else(|| s["room_id"].as_str())
+            .unwrap_or("unnamed skill")
+            .to_string()
+    };
+    let total: usize = skills
+        .iter()
+        .map(|s| s["content"].as_str().map_or(0, str::len))
+        .sum();
+
+    if total > MANDATE_INSTRUCTIONS_MAX_CHARS {
+        let names: Vec<String> = skills.iter().map(name_of).collect();
+        out.push_str(&format!(
+            "\nThe mandate is too long to include here. Skills: {}. Call nubi_get_mandate now to read it in full.\n",
+            names.join(", ")
+        ));
+        return out;
+    }
+
+    for skill in skills {
+        let suffix = if skill["required"].as_bool() == Some(false) {
+            " (suggested)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n### {}{}\n\n{}\n",
+            name_of(skill),
+            suffix,
+            skill["content"].as_str().unwrap_or("").trim()
+        ));
+    }
+    out
+}
+
+/// Applies a `mandate_update` SSE event. Returns the channel notification to
+/// push, or `None` when the event is for another agent or says nothing new.
+async fn apply_mandate_update(
+    mandate: &Mutex<MandateState>,
+    me: Option<&str>,
+    event: &Value,
+) -> Option<Value> {
+    let agent = event["agent_id"].as_str();
+    if let (Some(agent), Some(me)) = (agent, me) {
+        if !same_agent(agent, me) {
+            return None;
+        }
+    }
+    let hash = event["hash"].as_str().map(String::from);
+    let revision = event["revision"].as_u64();
+
+    let mut state = mandate.lock().await;
+    if hash.is_some() && hash == state.hash {
+        return None;
+    }
+    state.observe_hash(hash.clone());
+    state.revision = revision;
+    // The cached body is now out of date; the next tool call re-resolves.
+    state.checked_at = None;
+
+    let rev = revision
+        .map(|r| format!(" (rev {})", r))
+        .unwrap_or_default();
+    Some(channel_notification(
+        format!(
+            "Your mandate changed{}; call nubi_get_mandate before you act on anything else.",
+            rev
+        ),
+        json!({
+            "event": "mandate_update",
+            "agent_id": agent,
+            "revision": revision,
+            "hash": hash
+        }),
+    ))
+}
+
 struct NubiClient {
     config: Arc<RwLock<Config>>,
     http: reqwest::Client,
+    mandate: Arc<Mutex<MandateState>>,
 }
 
 impl NubiClient {
@@ -115,7 +348,158 @@ impl NubiClient {
     }
 
     fn with_http(config: Arc<RwLock<Config>>, http: reqwest::Client) -> Self {
-        Self { config, http }
+        Self::with_mandate(config, http, Arc::default())
+    }
+
+    fn with_mandate(
+        config: Arc<RwLock<Config>>,
+        http: reqwest::Client,
+        mandate: Arc<Mutex<MandateState>>,
+    ) -> Self {
+        Self {
+            config,
+            http,
+            mandate,
+        }
+    }
+
+    /// Resolves the caller's mandate with a conditional GET.
+    ///
+    /// `Ok(None)` means no mandate: the engine answered 404, which is also
+    /// what an engine without skill sets answers.
+    async fn fetch_mandate(&self) -> Result<Option<Value>, String> {
+        let agent = self
+            .self_id()
+            .await
+            .ok_or("could not work out which agent this token belongs to")?;
+        let (url, token) = {
+            let c = self.config.read().await;
+            (
+                format!(
+                    "{}/v1/spaces/{}/agents/{}/mandate",
+                    c.base_url,
+                    c.space_id,
+                    urlencoding::encode(&agent)
+                ),
+                c.token.clone(),
+            )
+        };
+        let etag = {
+            let state = self.mandate.lock().await;
+            state.body.as_ref().and(state.etag.clone())
+        };
+
+        let mut req = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token));
+        if let Some(etag) = etag {
+            req = req.header(header::IF_NONE_MATCH.as_str(), etag);
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+
+        match res.status().as_u16() {
+            304 => {
+                let mut state = self.mandate.lock().await;
+                let body = state
+                    .body
+                    .clone()
+                    .ok_or("engine answered 304 for a mandate this session never fetched")?;
+                let hash = state.body_hash.clone();
+                state.observe_hash(hash);
+                state.checked_at = Some(Instant::now());
+                Ok(Some(body))
+            }
+            404 => {
+                self.mandate.lock().await.set_absent();
+                Ok(None)
+            }
+            s if (200..300).contains(&s) => {
+                let etag = res
+                    .headers()
+                    .get(header::ETAG.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let body: Value = res.json().await.map_err(|e| e.to_string())?;
+                self.mandate.lock().await.set_resolved(body.clone(), etag);
+                Ok(Some(body))
+            }
+            _ => {
+                let status = res.status();
+                let text = res.text().await.unwrap_or_default();
+                Err(format!("HTTP {}: {}", status, text))
+            }
+        }
+    }
+
+    /// `nubi_get_mandate`: resolves the mandate and marks it served, which is
+    /// what later allows `nubi_send` to stamp its hash.
+    async fn get_mandate(&self) -> Result<Value, String> {
+        match self.fetch_mandate().await? {
+            Some(body) => {
+                let mut state = self.mandate.lock().await;
+                // Only if nothing newer arrived while this body was in flight.
+                if state.body.as_ref() == Some(&body) {
+                    state.served = state.hash.clone();
+                }
+                Ok(body)
+            }
+            None => Ok(json!({
+                "mandate": null,
+                "message": "No mandate is attached to you."
+            })),
+        }
+    }
+
+    /// Re-checks the mandate if it has not been checked recently. Failures
+    /// are logged and leave the last known state in place: a flaky engine is
+    /// no reason to fail an unrelated tool call.
+    async fn refresh_mandate_if_due(&self) {
+        {
+            let mut state = self.mandate.lock().await;
+            if state
+                .checked_at
+                .is_some_and(|t| t.elapsed() < MANDATE_RECHECK)
+            {
+                return;
+            }
+            state.checked_at = Some(Instant::now());
+        }
+        if let Err(e) = self.fetch_mandate().await {
+            eprintln!("nubi: mandate check failed: {}", e);
+        }
+    }
+
+    /// The mandate to put in `initialize.instructions`, bounded in time.
+    async fn mandate_for_initialize(&self) -> Option<Value> {
+        match tokio::time::timeout(MANDATE_INIT_TIMEOUT, self.fetch_mandate()).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(e)) => {
+                eprintln!("nubi: mandate unavailable at initialize: {}", e);
+                None
+            }
+            Err(_) => {
+                eprintln!("nubi: mandate fetch timed out at initialize");
+                None
+            }
+        }
+    }
+
+    async fn list_skill_sets(&self, status: Option<&str>) -> Result<Value, String> {
+        let mut path = format!("/v1/spaces/{}/skill-sets", self.space_id().await);
+        if let Some(s) = status {
+            path = format!("{}?status={}", path, urlencoding::encode(s));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    async fn get_skill_set(&self, set_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/skill-sets/{}",
+            self.space_id().await,
+            urlencoding::encode(set_id)
+        );
+        self.request(reqwest::Method::GET, &path, None).await
     }
 
     async fn request(
@@ -261,8 +645,17 @@ impl NubiClient {
             "parts": [{ "kind": "text", "text": text }],
             "mentions": mentions
         });
+        let mut metadata = serde_json::Map::new();
         if let Some(ids) = expect_reply {
-            body["metadata"] = json!({ "expect_reply": ids });
+            metadata.insert("expect_reply".into(), json!(ids));
+        }
+        // Proof for the engine that the sender read the current mandate. Only
+        // a hash this session actually showed the model is ever sent.
+        if let Some(hash) = self.mandate.lock().await.stamp() {
+            metadata.insert("mandate_hash".into(), json!(hash));
+        }
+        if !metadata.is_empty() {
+            body["metadata"] = Value::Object(metadata);
         }
 
         self.request(reqwest::Method::POST, &path, Some(body)).await
@@ -485,6 +878,7 @@ async fn spawn_subscription(
     target: Target,
     mentioned_only: bool,
     notify_tx: &mpsc::UnboundedSender<Value>,
+    mandate: &Arc<Mutex<MandateState>>,
 ) -> bool {
     let mut subs = subscriptions.lock().await;
     // A finished task means the subscription died; replace it rather than
@@ -496,8 +890,11 @@ async fn spawn_subscription(
     let key = target.key().to_string();
     let cfg = config.clone();
     let tx = notify_tx.clone();
+    let mandate = mandate.clone();
     let handle =
-        tokio::spawn(async move { run_subscription(cfg, target, mentioned_only, tx).await });
+        tokio::spawn(
+            async move { run_subscription(cfg, target, mentioned_only, tx, mandate).await },
+        );
 
     subs.insert(key, handle);
     true
@@ -511,6 +908,7 @@ async fn run_subscription(
     target: Target,
     mentioned_only: bool,
     notify_tx: mpsc::UnboundedSender<Value>,
+    mandate: Arc<Mutex<MandateState>>,
 ) {
     let client = reqwest::Client::new();
     let mut last_event_id: Option<String> = None;
@@ -525,6 +923,7 @@ async fn run_subscription(
             mentioned_only,
             &mut last_event_id,
             &notify_tx,
+            &mandate,
         )
         .await;
 
@@ -559,6 +958,7 @@ async fn stream_once(
     mentioned_only: bool,
     last_event_id: &mut Option<String>,
     notify_tx: &mpsc::UnboundedSender<Value>,
+    mandate: &Mutex<MandateState>,
 ) -> Outcome {
     let url = target.url(config, mentioned_only);
 
@@ -639,6 +1039,18 @@ async fn stream_once(
                     format!("[{}] room unavailable: {}", room, message),
                     json!({ "room_id": room, "event": "room_error" }),
                 ));
+                continue;
+            }
+
+            // The engine recomputed this agent's mandate. Whatever the model
+            // was served is no longer proof of anything, so the stamp stops
+            // until it reads the new one.
+            if event_type == "mandate_update" {
+                if let Some(note) =
+                    apply_mandate_update(mandate, config.agent_id.as_deref(), &parsed).await
+                {
+                    let _ = notify_tx.send(note);
+                }
                 continue;
             }
 
@@ -727,7 +1139,9 @@ fn negotiate_version(params: &Value) -> String {
     }
 }
 
-fn initialize_result(params: &Value) -> Value {
+/// `mandate` is the caller's resolved mandate, if any; it is appended to the
+/// instructions so the model meets it before its first tool call.
+fn initialize_result(params: &Value, mandate: Option<&Value>) -> Value {
     json!({
         "protocolVersion": negotiate_version(params),
         "capabilities": {
@@ -737,7 +1151,7 @@ fn initialize_result(params: &Value) -> Value {
             }
         },
         "serverInfo": { "name": "nubi-mcp", "version": "0.1.0" },
-        "instructions": "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages."
+        "instructions": instructions_with_mandate(mandate)
     })
 }
 
@@ -780,6 +1194,30 @@ fn tools_list_full() -> Value {
                     "type": "object",
                     "properties": { "room_id": { "type": "string", "description": "The skill room id" } },
                     "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_get_mandate",
+                "description": "Read your mandate: the skills you are bound to follow, in order, with their full content and a hash. Call it before your first message and whenever you are told the mandate changed; your messages only carry proof that you read the current mandate after you have called this.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "nubi_list_skill_sets",
+                "description": "List skill sets you are a member of or are bound to",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skill sets in this status" }
+                    }
+                }
+            },
+            {
+                "name": "nubi_get_skill_set",
+                "description": "Get a skill set: its details and the skills it holds (names and statuses, not content)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "set_id": { "type": "string", "description": "The skill set id" } },
+                    "required": ["set_id"]
                 }
             },
             {
@@ -938,6 +1376,12 @@ async fn handle_tool_call(
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_skill_prompt(room_id).await
         }
+        "nubi_get_mandate" => client.get_mandate().await,
+        "nubi_list_skill_sets" => client.list_skill_sets(args["status"].as_str()).await,
+        "nubi_get_skill_set" => {
+            let set_id = args["set_id"].as_str().ok_or("set_id required")?;
+            client.get_skill_set(set_id).await
+        }
         "nubi_get_room" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_room(room_id).await
@@ -1039,6 +1483,7 @@ async fn handle_tool_call(
                 Target::from(room_id),
                 mentioned_only,
                 notify_tx,
+                &client.mandate,
             )
             .await;
 
@@ -1063,6 +1508,37 @@ async fn handle_tool_call(
     }
 }
 
+/// Runs a tool and wraps its result for MCP, prepending the one-line mandate
+/// header while a mandate exists. Shared by stdio and hosted mode.
+async fn call_tool(
+    client: &NubiClient,
+    name: &str,
+    args: &Value,
+    config: &Arc<RwLock<Config>>,
+    subscriptions: &Subscriptions,
+    notify_tx: &mpsc::UnboundedSender<Value>,
+) -> Value {
+    // nubi_get_mandate resolves the mandate itself, and its body already
+    // says everything the header would.
+    let is_mandate_tool = name == "nubi_get_mandate";
+    if !is_mandate_tool {
+        client.refresh_mandate_if_due().await;
+    }
+
+    let result = handle_tool_call(client, name, args, config, subscriptions, notify_tx).await;
+    let (mut text, is_error) = match result {
+        Ok(v) => (serde_json::to_string_pretty(&v).unwrap(), false),
+        Err(e) => (format!("Error: {}", e), true),
+    };
+
+    if !is_mandate_tool {
+        if let Some(header) = client.mandate.lock().await.header() {
+            text = format!("{}\n{}", header, text);
+        }
+    }
+    tool_text_result(text, is_error)
+}
+
 async fn handle_request(
     client: &NubiClient,
     req: JsonRpcRequest,
@@ -1071,22 +1547,17 @@ async fn handle_request(
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Option<JsonRpcResponse> {
     let result = match req.method.as_str() {
-        "initialize" => Ok(initialize_result(&req.params)),
+        "initialize" => {
+            let mandate = client.mandate_for_initialize().await;
+            Ok(initialize_result(&req.params, mandate.as_ref()))
+        }
         "notifications/initialized" => return None,
         "ping" => Ok(json!({})),
         "tools/list" => Ok(tools_list(false)),
         "tools/call" => {
             let name = req.params["name"].as_str().unwrap_or("");
             let args = &req.params["arguments"];
-            match handle_tool_call(client, name, args, config, subscriptions, notify_tx).await {
-                Ok(v) => Ok(json!({
-                    "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap() }]
-                })),
-                Err(e) => Ok(json!({
-                    "content": [{ "type": "text", "text": format!("Error: {}", e) }],
-                    "isError": true
-                })),
-            }
+            Ok(call_tool(client, name, args, config, subscriptions, notify_tx).await)
         }
         _ => Err(format!("unknown method: {}", req.method)),
     };
@@ -1126,6 +1597,27 @@ struct HttpState {
 struct Me {
     space_id: String,
     agent_id: String,
+    /// The token's mandate as this server last saw it, and whether the model
+    /// behind the token was served it. Shared by every request on the token,
+    /// since hosted mode keeps no other session.
+    mandate: Arc<Mutex<MandateState>>,
+}
+
+impl Me {
+    /// A client acting as this token, sharing its mandate state.
+    fn client(&self, state: &HttpState, token: &str) -> (NubiClient, Arc<RwLock<Config>>) {
+        let config = Arc::new(RwLock::new(Config {
+            base_url: state.base_url.clone(),
+            token: token.to_string(),
+            space_id: self.space_id.clone(),
+            agent_id: Some(self.agent_id.clone()),
+            token_file: None,
+            subscribe: None,
+        }));
+        let client =
+            NubiClient::with_mandate(config.clone(), state.http.clone(), self.mandate.clone());
+        (client, config)
+    }
 }
 
 async fn resolve_me(state: &HttpState, token: &str) -> Result<Me, String> {
@@ -1160,13 +1652,18 @@ async fn resolve_me(state: &HttpState, token: &str) -> Result<Me, String> {
             .as_str()
             .ok_or("engine /v1/me returned no agent_id")?
             .to_string(),
+        mandate: Arc::default(),
     };
 
-    state
+    // Two first requests on one token can race here; keep whichever entry
+    // landed first so they share one mandate state.
+    let me = state
         .me_cache
         .write()
         .await
-        .insert(token.to_string(), me.clone());
+        .entry(token.to_string())
+        .or_insert(me)
+        .clone();
 
     Ok(me)
 }
@@ -1203,7 +1700,15 @@ async fn handle_http_request(
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
     match req.method.as_str() {
-        "initialize" => rpc_ok(req.id, initialize_result(&req.params)),
+        "initialize" => {
+            // A token the engine rejects still gets a handshake; the error
+            // surfaces on the first tool call instead.
+            let mandate = match resolve_me(state, token).await {
+                Ok(me) => me.client(state, token).0.mandate_for_initialize().await,
+                Err(_) => None,
+            };
+            rpc_ok(req.id, initialize_result(&req.params, mandate.as_ref()))
+        }
         "ping" => rpc_ok(req.id, json!({})),
         "tools/list" => rpc_ok(req.id, tools_list(true)),
         "tools/call" => {
@@ -1222,28 +1727,17 @@ async fn handle_http_request(
                 Err(e) => return rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
             };
 
-            let config = Arc::new(RwLock::new(Config {
-                base_url: state.base_url.clone(),
-                token: token.to_string(),
-                space_id: me.space_id,
-                agent_id: Some(me.agent_id),
-                token_file: None,
-                subscribe: None,
-            }));
-            let client = NubiClient::with_http(config.clone(), state.http.clone());
+            let (client, config) = me.client(state, token);
 
             // Hosted mode never spawns subscriptions; these satisfy the
             // shared handle_tool_call signature.
             let subscriptions: Subscriptions = Arc::new(Mutex::new(HashMap::new()));
             let (notify_tx, _notify_rx) = mpsc::unbounded_channel::<Value>();
 
-            match handle_tool_call(&client, name, args, &config, &subscriptions, &notify_tx).await {
-                Ok(v) => rpc_ok(
-                    req.id,
-                    tool_text_result(serde_json::to_string_pretty(&v).unwrap(), false),
-                ),
-                Err(e) => rpc_ok(req.id, tool_text_result(format!("Error: {}", e), true)),
-            }
+            rpc_ok(
+                req.id,
+                call_tool(&client, name, args, &config, &subscriptions, &notify_tx).await,
+            )
         }
         other => rpc_err(req.id, -32601, format!("unknown method: {}", other)),
     }
@@ -1359,7 +1853,15 @@ async fn main() {
     if let Some(spec) = config.read().await.subscribe.clone() {
         for target in startup_targets(&spec) {
             eprintln!("nubi: subscribing to {} (mentions only)", target.key());
-            spawn_subscription(&subscriptions, &config, target, true, &notify_tx).await;
+            spawn_subscription(
+                &subscriptions,
+                &config,
+                target,
+                true,
+                &notify_tx,
+                &client.mandate,
+            )
+            .await;
         }
     }
 
@@ -1575,6 +2077,7 @@ mod tests {
             Target::Room("r1".into()),
             false,
             tx,
+            Arc::default(),
         ));
 
         let first = rx.recv().await.expect("first event");
@@ -1612,7 +2115,7 @@ mod tests {
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        run_subscription(config, Target::Room("r1".into()), false, tx).await;
+        run_subscription(config, Target::Room("r1".into()), false, tx, Arc::default()).await;
 
         let note = rx.recv().await.expect("failure notification");
         assert_eq!(note["params"]["meta"]["event"], "subscription_failed");
@@ -1662,6 +2165,7 @@ mod tests {
             false,
             &mut None,
             &tx,
+            &Mutex::default(),
         )
         .await;
 
@@ -1830,5 +2334,473 @@ mod tests {
             json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
         );
         assert_eq!(queries.lock().await[0], "kind=skill&status=published");
+    }
+
+    // --- Mandate and skill sets ---
+
+    /// A mock engine with skill sets: `/v1/me`, a mutable mandate (`None`
+    /// answers 404), message and skill-set endpoints, recording what it saw.
+    #[derive(Clone, Default)]
+    struct MockEngine {
+        mandate: Arc<Mutex<Option<Value>>>,
+        if_none_match: Arc<Mutex<Vec<Option<String>>>>,
+        sent: SentBodies,
+        paths: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn mandate_body(hash: &str, content: &str) -> Value {
+        json!({
+            "agent_id": "bot",
+            "hash": hash,
+            "generated_at_ms": 1730000000000u64,
+            "policy": { "skills_policy": "mandate_first", "enforce_mandate": false },
+            "sets": [{ "set_id": "tier1", "name": "Tier 1 support", "revision": 7, "position": 0 }],
+            "skills": [{
+                "room_id": "refunds", "name": "Refund policy", "from_set": "tier1",
+                "version_index": 14, "pinned": false, "required": true, "content": content
+            }],
+            "warnings": []
+        })
+    }
+
+    async fn spawn_engine(mandate: Option<Value>) -> (String, MockEngine) {
+        let engine = MockEngine::default();
+        *engine.mandate.lock().await = mandate;
+
+        let app = axum::Router::new()
+            .route(
+                "/v1/me",
+                get(|| async { axum::Json(json!({ "agent_id": "bot", "space_id": "s" })) }),
+            )
+            .route(
+                "/v1/spaces/{space}/agents/{agent}/mandate",
+                get(
+                    |State(e): State<MockEngine>, headers: HeaderMap| async move {
+                        let inm = headers
+                            .get(header::IF_NONE_MATCH)
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from);
+                        e.if_none_match.lock().await.push(inm.clone());
+                        let Some(body) = e.mandate.lock().await.clone() else {
+                            return StatusCode::NOT_FOUND.into_response();
+                        };
+                        let etag = format!("\"{}\"", body["hash"].as_str().unwrap());
+                        if inm.as_deref() == Some(etag.as_str()) {
+                            return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)])
+                                .into_response();
+                        }
+                        ([(header::ETAG, etag)], axum::Json(body)).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/messages",
+                axum::routing::post(
+                    |State(e): State<MockEngine>, axum::Json(body): axum::Json<Value>| async move {
+                        e.sent.lock().await.push(body);
+                        axum::Json(json!({ "ok": true }))
+                    },
+                ),
+            )
+            .route(
+                "/v1/spaces/{space}/rooms",
+                get(|| async { axum::Json(json!([])) }),
+            )
+            .route(
+                "/v1/spaces/{space}/skill-sets",
+                get(
+                    |State(e): State<MockEngine>, uri: axum::http::Uri| async move {
+                        e.paths.lock().await.push(uri.to_string());
+                        axum::Json(json!([{ "id": "tier1", "name": "Tier 1 support" }]))
+                    },
+                ),
+            )
+            .route(
+                "/v1/spaces/{space}/skill-sets/{set}",
+                get(
+                    |State(e): State<MockEngine>, uri: axum::http::Uri| async move {
+                        e.paths.lock().await.push(uri.to_string());
+                        axum::Json(json!({ "id": "tier1", "skills": [] }))
+                    },
+                ),
+            )
+            .with_state(engine.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", addr), engine)
+    }
+
+    fn stdio_client(base_url: &str) -> (NubiClient, Arc<RwLock<Config>>) {
+        let config = Arc::new(RwLock::new(Config {
+            base_url: base_url.to_string(),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: Some("bot".into()),
+            token_file: None,
+            subscribe: None,
+        }));
+        (NubiClient::new(config.clone()), config)
+    }
+
+    /// Calls a tool the way the stdio loop does and returns its text.
+    async fn call(
+        client: &NubiClient,
+        config: &Arc<RwLock<Config>>,
+        name: &str,
+        args: Value,
+    ) -> String {
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = call_tool(client, name, &args, config, &subs, &tx).await;
+        result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn get_mandate_sends_if_none_match_and_reuses_the_body_on_304() {
+        let (base, engine) =
+            spawn_engine(Some(mandate_body("sha256:aaa", "Refund within 30 days."))).await;
+        let (client, _) = stdio_client(&base);
+
+        let first = client.get_mandate().await.unwrap();
+        let second = client.get_mandate().await.unwrap();
+
+        assert_eq!(first["hash"], "sha256:aaa");
+        assert_eq!(second, first, "a 304 must hand back the cached body");
+        assert_eq!(
+            *engine.if_none_match.lock().await,
+            vec![None, Some("\"sha256:aaa\"".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_mandate_endpoint_means_no_mandate() {
+        let (base, engine) = spawn_engine(None).await;
+        let (client, config) = stdio_client(&base);
+
+        let body = client.get_mandate().await.unwrap();
+        assert_eq!(body["mandate"], Value::Null);
+
+        let text = call(
+            &client,
+            &config,
+            "nubi_send",
+            json!({ "room_id": "r1", "text": "hi" }),
+        )
+        .await;
+        assert!(
+            !text.starts_with("[mandate"),
+            "no header without a mandate: {}",
+            text
+        );
+        assert!(engine.sent.lock().await[0].get("metadata").is_none());
+    }
+
+    #[test]
+    fn tools_list_includes_the_mandate_and_skill_set_tools_in_both_modes() {
+        for hosted in [false, true] {
+            let list = tools_list(hosted);
+            let names: Vec<&str> = list["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect();
+            for tool in [
+                "nubi_get_mandate",
+                "nubi_list_skill_sets",
+                "nubi_get_skill_set",
+                "nubi_get_skill",
+                "nubi_list_skills",
+            ] {
+                assert!(
+                    names.contains(&tool),
+                    "{} missing (hosted={})",
+                    tool,
+                    hosted
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn header_is_prepended_only_while_a_mandate_exists() {
+        let (base, _engine) =
+            spawn_engine(Some(mandate_body("sha256:0123456789abcdef", "x"))).await;
+        let (client, config) = stdio_client(&base);
+
+        let unread = call(&client, &config, "nubi_list_rooms", json!({})).await;
+        let first_line = unread.lines().next().unwrap();
+        assert_eq!(
+            first_line,
+            "[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]"
+        );
+
+        let body = call(&client, &config, "nubi_get_mandate", json!({})).await;
+        assert!(
+            body.starts_with('{'),
+            "nubi_get_mandate carries no header: {}",
+            body
+        );
+
+        let read = call(&client, &config, "nubi_list_rooms", json!({})).await;
+        assert_eq!(
+            read.lines().next().unwrap(),
+            "[mandate hash sha256:0123456789ab]"
+        );
+
+        let (base, _engine) = spawn_engine(None).await;
+        let (client, config) = stdio_client(&base);
+        let none = call(&client, &config, "nubi_list_rooms", json!({})).await;
+        assert_eq!(none, "[]");
+    }
+
+    #[tokio::test]
+    async fn send_stamps_the_mandate_hash_only_after_it_was_served() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, config) = stdio_client(&base);
+        let send = json!({ "room_id": "r1", "text": "hi" });
+
+        // The tool call resolves the mandate (for the header), but the model
+        // has not read it, so there is nothing honest to stamp.
+        call(&client, &config, "nubi_send", send.clone()).await;
+        call(&client, &config, "nubi_get_mandate", json!({})).await;
+        call(&client, &config, "nubi_send", send.clone()).await;
+
+        // The engine moves on; the next check notices and the stamp stops.
+        *engine.mandate.lock().await = Some(mandate_body("sha256:bbb", "y"));
+        client.mandate.lock().await.checked_at = None;
+        call(&client, &config, "nubi_send", send.clone()).await;
+
+        let sent = engine.sent.lock().await;
+        assert!(
+            sent[0].get("metadata").is_none(),
+            "stamped before served: {}",
+            sent[0]
+        );
+        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert!(
+            sent[2].get("metadata").is_none(),
+            "stamped a hash the model never saw: {}",
+            sent[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn stamp_sits_beside_expect_reply() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+        client.get_mandate().await.unwrap();
+        client
+            .send_message("r1", "?", vec!["apple".into()], Some(vec!["apple".into()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.sent.lock().await[0]["metadata"],
+            json!({ "expect_reply": ["apple"], "mandate_hash": "sha256:aaa" })
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_update_on_the_stream_clears_the_stamp_and_notifies() {
+        let (base, _engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+        client.get_mandate().await.unwrap();
+        assert_eq!(client.mandate.lock().await.stamp(), Some("sha256:aaa"));
+
+        let body = format!(
+            "event: mandate_update\ndata: {}\n\nevent: mandate_update\ndata: {}\n\n",
+            json!({ "agent_id": "someone-else", "revision": 3, "hash": "sha256:zzz" }),
+            json!({ "agent_id": "bot", "revision": 8, "hash": "sha256:bbb" })
+        );
+        let app = axum::Router::new().route(
+            "/v1/spaces/{space}/stream",
+            get(|| async move {
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: Some("bot".into()),
+            token_file: None,
+            subscribe: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        stream_once(
+            &reqwest::Client::new(),
+            &config,
+            &Target::Space,
+            true,
+            &mut None,
+            &tx,
+            &client.mandate,
+        )
+        .await;
+        drop(tx);
+
+        let note = rx.recv().await.expect("mandate_update notification");
+        assert_eq!(note["method"], "notifications/claude/channel");
+        assert_eq!(note["params"]["meta"]["event"], "mandate_update");
+        assert_eq!(note["params"]["meta"]["revision"], 8);
+        assert!(note["params"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("call nubi_get_mandate"));
+        assert!(
+            rx.recv().await.is_none(),
+            "the other agent's update must be ignored"
+        );
+
+        let state = client.mandate.lock().await;
+        assert_eq!(
+            state.stamp(),
+            None,
+            "served flag must clear on mandate_update"
+        );
+        assert_eq!(state.hash.as_deref(), Some("sha256:bbb"));
+        assert!(state.checked_at.is_none(), "next tool call must re-resolve");
+    }
+
+    #[test]
+    fn instructions_carry_the_mandate_only_when_there_is_one() {
+        assert_eq!(instructions_with_mandate(None), BASE_INSTRUCTIONS);
+        let empty = json!({ "hash": "sha256:e", "skills": [] });
+        assert_eq!(instructions_with_mandate(Some(&empty)), BASE_INSTRUCTIONS);
+
+        let text =
+            instructions_with_mandate(Some(&mandate_body("sha256:aaa", "Refund within 30 days.")));
+        assert!(text.starts_with(BASE_INSTRUCTIONS));
+        assert!(text.contains("## Mandate — you must follow these"));
+        assert!(text.contains("sha256:aaa"));
+        assert!(text.contains("### Refund policy\n\nRefund within 30 days."));
+
+        let huge = mandate_body(
+            "sha256:aaa",
+            &"x".repeat(MANDATE_INSTRUCTIONS_MAX_CHARS + 1),
+        );
+        let text = instructions_with_mandate(Some(&huge));
+        assert!(text.contains("Skills: Refund policy. Call nubi_get_mandate"));
+        assert!(!text.contains("xxxx"));
+    }
+
+    #[tokio::test]
+    async fn stdio_initialize_includes_the_mandate() {
+        let (base, _engine) = spawn_engine(Some(mandate_body("sha256:aaa", "Be kind."))).await;
+        let (client, config) = stdio_client(&base);
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: "initialize".into(),
+            params: json!({}),
+        };
+        let resp = handle_request(&client, req, &config, &subs, &tx)
+            .await
+            .unwrap();
+        let instructions = resp.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(instructions.contains("Be kind."));
+        // Instructions are not proof the model read it.
+        assert_eq!(client.mandate.lock().await.stamp(), None);
+    }
+
+    #[tokio::test]
+    async fn hosted_mode_serves_and_stamps_per_token() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "Be kind."))).await;
+        let state = HttpState {
+            base_url: base,
+            http: reqwest::Client::new(),
+            me_cache: Arc::default(),
+        };
+        let rpc = |method: &str, params: Value| JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        };
+        let send = json!({ "name": "nubi_send", "arguments": { "room_id": "r1", "text": "hi" } });
+
+        let init = handle_http_request(&state, "tok", rpc("initialize", json!({}))).await;
+        assert!(init.result.unwrap()["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Be kind."));
+
+        let first = handle_http_request(&state, "tok", rpc("tools/call", send.clone())).await;
+        let text = first.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(text.starts_with("[mandate hash sha256:aaa; call nubi_get_mandate"));
+
+        handle_http_request(
+            &state,
+            "tok",
+            rpc(
+                "tools/call",
+                json!({ "name": "nubi_get_mandate", "arguments": {} }),
+            ),
+        )
+        .await;
+        handle_http_request(&state, "tok", rpc("tools/call", send.clone())).await;
+        // A different token is a different session: it was never served.
+        handle_http_request(&state, "other", rpc("tools/call", send.clone())).await;
+
+        let sent = engine.sent.lock().await;
+        assert!(sent[0].get("metadata").is_none());
+        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert!(sent[2].get("metadata").is_none());
+    }
+
+    #[tokio::test]
+    async fn skill_set_tools_call_the_skill_set_endpoints() {
+        let (base, engine) = spawn_engine(None).await;
+        let (client, config) = stdio_client(&base);
+        call(&client, &config, "nubi_list_skill_sets", json!({})).await;
+        call(
+            &client,
+            &config,
+            "nubi_list_skill_sets",
+            json!({ "status": "published" }),
+        )
+        .await;
+        let set = call(
+            &client,
+            &config,
+            "nubi_get_skill_set",
+            json!({ "set_id": "tier 1" }),
+        )
+        .await;
+        assert!(set.contains("\"id\": \"tier1\""));
+        assert_eq!(
+            *engine.paths.lock().await,
+            vec![
+                "/v1/spaces/s/skill-sets",
+                "/v1/spaces/s/skill-sets?status=published",
+                "/v1/spaces/s/skill-sets/tier%201",
+            ]
+        );
+    }
+
+    #[test]
+    fn etags_and_hashes_normalise() {
+        assert_eq!(unquote_etag("\"sha256:ab\""), "sha256:ab");
+        assert_eq!(unquote_etag("W/\"sha256:ab\""), "sha256:ab");
+        assert_eq!(unquote_etag("sha256:ab"), "sha256:ab");
+        assert_eq!(short_hash("sha256:0123456789abcdef"), "sha256:0123456789ab");
+        assert_eq!(short_hash("sha256:ab"), "sha256:ab");
     }
 }

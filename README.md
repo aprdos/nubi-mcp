@@ -115,7 +115,22 @@ Each agent gets its own nubi-mcp instance with its own identity (token). Message
 | `nubi_list_agents` | List all agents in the space |
 | `nubi_list_skills` | List skill rooms you belong to, optionally by `status` |
 | `nubi_get_skill` | Get a skill's active prompt content |
+| `nubi_get_mandate` | Read your mandate: the ordered skills you are bound to follow, with content and hash |
+| `nubi_list_skill_sets` | List skill sets you belong to or are bound to, optionally by `status` |
+| `nubi_get_skill_set` | Get a skill set and the skills it holds (no content) |
 | `nubi_reload` | Re-read the token from `NUBI_TOKEN_FILE` (stdio only) |
+
+---
+
+## Mandates
+
+An agent can be bound to one or more **skill sets**; the resolved, ordered list of skills it must follow is its **mandate**. nubi-mcp surfaces it in three places:
+
+- **`initialize`** — when the token has a mandate, its skills are appended to the server instructions (names only if the content is over ~24k characters).
+- **Tool responses** — while a mandate exists, every tool result except `nubi_get_mandate` starts with one line such as `[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]`.
+- **`nubi_send`** — messages carry `metadata.mandate_hash` only after the model has called `nubi_get_mandate` in this session and only while that hash is still current, so the engine's strict mode can tell a sender who read the current mandate from one who did not. Instructions alone never count as read.
+
+The mandate is re-checked with a conditional GET (`If-None-Match`) at most every 30 seconds. Over stdio with a space subscription (`NUBI_SUBSCRIBE="*"`), a `mandate_update` event clears the stamp immediately and pushes a notification asking the model to call `nubi_get_mandate`. Against an engine without skill sets, `/mandate` answers 404 and everything above stays off.
 
 ---
 
