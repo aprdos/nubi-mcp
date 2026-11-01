@@ -118,6 +118,30 @@ const MANDATE_INIT_TIMEOUT: Duration = Duration::from_secs(3);
 /// only; the model reads the content through `nubi_get_mandate`.
 const MANDATE_INSTRUCTIONS_MAX_CHARS: usize = 24_000;
 
+/// How long any request to the engine may take to connect, and how long a
+/// plain (non-streaming) request may take in all, so an unresponsive engine
+/// turns into a tool error instead of a hung tool call.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The client for ordinary request/response calls to the engine.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+        .expect("reqwest client")
+}
+
+/// The client for SSE subscriptions: a connect timeout only, since the
+/// response body is meant to stay open indefinitely.
+fn stream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .build()
+        .expect("reqwest client")
+}
+
 const BASE_INSTRUCTIONS: &str = "Events from Nubi rooms arrive as <channel source=\"nubi\">. These contain messages from rooms you're subscribed to. Respond appropriately to mentions and messages.";
 
 /// What this session knows about the caller's mandate.
@@ -142,6 +166,10 @@ struct MandateState {
     /// in this session. Cleared the moment the engine reports anything else,
     /// so a send is never stamped with a hash the model did not read.
     served: Option<String>,
+    /// Bumped whenever `hash`, `body` or `etag` change. A fetch snapshots it
+    /// before going to the engine and writes nothing back if it moved on in
+    /// the meantime, so a slow response cannot overwrite a newer one.
+    generation: u64,
 }
 
 impl MandateState {
@@ -150,6 +178,9 @@ impl MandateState {
     fn observe_hash(&mut self, hash: Option<String>) {
         if self.served != hash {
             self.served = None;
+        }
+        if self.hash != hash {
+            self.generation += 1;
         }
         self.hash = hash;
     }
@@ -160,7 +191,19 @@ impl MandateState {
         self.body = None;
         self.body_hash = None;
         self.etag = None;
+        self.generation += 1;
         self.checked_at = Some(Instant::now());
+    }
+
+    /// Marks `body` as read by the model, if it is still the cached one. The
+    /// mark carries the body's own hash, not whatever the engine has since
+    /// announced: a `mandate_update` that lands while the fetch is in flight
+    /// moves `hash` on without replacing `body`, and stamping that newer
+    /// hash would claim the model read something it never saw.
+    fn mark_served(&mut self, body: &Value) {
+        if self.body.as_ref() == Some(body) {
+            self.served = self.body_hash.clone();
+        }
     }
 
     fn set_resolved(&mut self, body: Value, etag: Option<String>) {
@@ -181,6 +224,7 @@ impl MandateState {
         self.body = Some(body);
         self.body_hash = hash;
         self.etag = etag;
+        self.generation += 1;
         self.checked_at = Some(Instant::now());
     }
 
@@ -296,26 +340,39 @@ fn instructions_with_mandate(mandate: Option<&Value>) -> String {
 
 /// Applies a `mandate_update` SSE event. Returns the channel notification to
 /// push, or `None` when the event is for another agent or says nothing new.
+///
+/// `me` is who this token belongs to, if known yet. An event that names an
+/// agent while that is still unknown is dropped rather than applied: the
+/// space stream carries every agent's updates, and acting on a stranger's
+/// would clear a stamp this agent honestly earned.
 async fn apply_mandate_update(
     mandate: &Mutex<MandateState>,
     me: Option<&str>,
     event: &Value,
 ) -> Option<Value> {
     let agent = event["agent_id"].as_str();
-    if let (Some(agent), Some(me)) = (agent, me) {
-        if !same_agent(agent, me) {
-            return None;
-        }
+    match (agent, me) {
+        (Some(agent), Some(me)) if !same_agent(agent, me) => return None,
+        (Some(_), None) => return None,
+        _ => {}
     }
     let hash = event["hash"].as_str().map(String::from);
     let revision = event["revision"].as_u64();
 
     let mut state = mandate.lock().await;
-    if hash.is_some() && hash == state.hash {
-        return None;
+    if hash.is_some() {
+        if hash == state.hash {
+            return None;
+        }
+        state.observe_hash(hash.clone());
+        state.revision = revision;
+    } else {
+        // An update that does not say what the mandate became still means
+        // the model's copy may be stale: stop stamping and re-resolve, but
+        // keep the hash, since nothing says the mandate is gone.
+        state.served = None;
+        state.revision = revision.or(state.revision);
     }
-    state.observe_hash(hash.clone());
-    state.revision = revision;
     // The cached body is now out of date; the next tool call re-resolves.
     state.checked_at = None;
 
@@ -344,7 +401,7 @@ struct NubiClient {
 
 impl NubiClient {
     fn new(config: Arc<RwLock<Config>>) -> Self {
-        Self::with_http(config, reqwest::Client::new())
+        Self::with_http(config, http_client())
     }
 
     fn with_http(config: Arc<RwLock<Config>>, http: reqwest::Client) -> Self {
@@ -384,50 +441,79 @@ impl NubiClient {
                 c.token.clone(),
             )
         };
-        let etag = {
-            let state = self.mandate.lock().await;
-            state.body.as_ref().and(state.etag.clone())
-        };
+        // A 304 is only usable while the body it refers to is still cached.
+        // If a parallel fetch dropped it (the engine answered that one 404)
+        // while this request was in flight, ask once more unconditionally.
+        let mut conditional = true;
+        loop {
+            let (etag, generation) = {
+                let state = self.mandate.lock().await;
+                let etag = state.body.as_ref().and(state.etag.clone());
+                (etag.filter(|_| conditional), state.generation)
+            };
 
-        let mut req = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token));
-        if let Some(etag) = etag {
-            req = req.header(header::IF_NONE_MATCH.as_str(), etag);
-        }
-        let res = req.send().await.map_err(|e| e.to_string())?;
+            let mut req = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token));
+            if let Some(etag) = etag {
+                req = req.header(header::IF_NONE_MATCH.as_str(), etag);
+            }
+            let res = req.send().await.map_err(|e| e.to_string())?;
 
-        match res.status().as_u16() {
-            304 => {
-                let mut state = self.mandate.lock().await;
-                let body = state
-                    .body
-                    .clone()
-                    .ok_or("engine answered 304 for a mandate this session never fetched")?;
-                let hash = state.body_hash.clone();
-                state.observe_hash(hash);
-                state.checked_at = Some(Instant::now());
-                Ok(Some(body))
-            }
-            404 => {
-                self.mandate.lock().await.set_absent();
-                Ok(None)
-            }
-            s if (200..300).contains(&s) => {
-                let etag = res
-                    .headers()
-                    .get(header::ETAG.as_str())
-                    .and_then(|v| v.to_str().ok())
-                    .map(String::from);
-                let body: Value = res.json().await.map_err(|e| e.to_string())?;
-                self.mandate.lock().await.set_resolved(body.clone(), etag);
-                Ok(Some(body))
-            }
-            _ => {
-                let status = res.status();
-                let text = res.text().await.unwrap_or_default();
-                Err(format!("HTTP {}: {}", status, text))
+            // Results land in state only if nothing else changed it since the
+            // request went out; a response that lost that race still goes to
+            // the caller, but the next tool call re-checks.
+            match res.status().as_u16() {
+                304 => {
+                    let mut state = self.mandate.lock().await;
+                    if let Some(body) = state.body.clone() {
+                        if state.generation == generation {
+                            let hash = state.body_hash.clone();
+                            state.observe_hash(hash);
+                            state.checked_at = Some(Instant::now());
+                        } else {
+                            state.checked_at = None;
+                        }
+                        return Ok(Some(body));
+                    }
+                    if !conditional {
+                        // Not modified relative to nothing: the engine is
+                        // confused; leave it for the next check.
+                        state.checked_at = None;
+                        return Ok(None);
+                    }
+                    conditional = false;
+                }
+                404 => {
+                    let mut state = self.mandate.lock().await;
+                    if state.generation == generation {
+                        state.set_absent();
+                    } else {
+                        state.checked_at = None;
+                    }
+                    return Ok(None);
+                }
+                s if (200..300).contains(&s) => {
+                    let etag = res
+                        .headers()
+                        .get(header::ETAG.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    let body: Value = res.json().await.map_err(|e| e.to_string())?;
+                    let mut state = self.mandate.lock().await;
+                    if state.generation == generation {
+                        state.set_resolved(body.clone(), etag);
+                    } else {
+                        state.checked_at = None;
+                    }
+                    return Ok(Some(body));
+                }
+                _ => {
+                    let status = res.status();
+                    let text = res.text().await.unwrap_or_default();
+                    return Err(format!("HTTP {}: {}", status, text));
+                }
             }
         }
     }
@@ -437,11 +523,7 @@ impl NubiClient {
     async fn get_mandate(&self) -> Result<Value, String> {
         match self.fetch_mandate().await? {
             Some(body) => {
-                let mut state = self.mandate.lock().await;
-                // Only if nothing newer arrived while this body was in flight.
-                if state.body.as_ref() == Some(&body) {
-                    state.served = state.hash.clone();
-                }
+                self.mandate.lock().await.mark_served(&body);
                 Ok(body)
             }
             None => Ok(json!({
@@ -910,15 +992,14 @@ async fn run_subscription(
     notify_tx: mpsc::UnboundedSender<Value>,
     mandate: Arc<Mutex<MandateState>>,
 ) {
-    let client = reqwest::Client::new();
+    let client = stream_client();
     let mut last_event_id: Option<String> = None;
     let mut delay_ms = RECONNECT_MIN_DELAY_MS;
 
     loop {
-        let cfg = config.read().await.clone();
         let outcome = stream_once(
             &client,
-            &cfg,
+            &config,
             &target,
             mentioned_only,
             &mut last_event_id,
@@ -951,20 +1032,27 @@ async fn run_subscription(
     }
 }
 
+/// `config` is shared rather than snapshotted because the stream can outlive
+/// what was known when it connected: a startup subscription opens before
+/// `initialize` has asked the engine who this token is, and `mandate_update`
+/// events must be matched against that answer once it exists.
 async fn stream_once(
     client: &reqwest::Client,
-    config: &Config,
+    config: &RwLock<Config>,
     target: &Target,
     mentioned_only: bool,
     last_event_id: &mut Option<String>,
     notify_tx: &mpsc::UnboundedSender<Value>,
     mandate: &Mutex<MandateState>,
 ) -> Outcome {
-    let url = target.url(config, mentioned_only);
+    let (url, token) = {
+        let cfg = config.read().await;
+        (target.url(&cfg, mentioned_only), cfg.token.clone())
+    };
 
     let mut req = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", config.token))
+        .header("Authorization", format!("Bearer {}", token))
         .header("Accept", "text/event-stream");
     // The space stream resumes from each room's committed offset instead, since
     // one event id cannot describe a position in every room at once.
@@ -1046,9 +1134,8 @@ async fn stream_once(
             // was served is no longer proof of anything, so the stamp stops
             // until it reads the new one.
             if event_type == "mandate_update" {
-                if let Some(note) =
-                    apply_mandate_update(mandate, config.agent_id.as_deref(), &parsed).await
-                {
+                let me = config.read().await.agent_id.clone();
+                if let Some(note) = apply_mandate_update(mandate, me.as_deref(), &parsed).await {
                     let _ = notify_tx.send(note);
                 }
                 continue;
@@ -1508,8 +1595,10 @@ async fn handle_tool_call(
     }
 }
 
-/// Runs a tool and wraps its result for MCP, prepending the one-line mandate
-/// header while a mandate exists. Shared by stdio and hosted mode.
+/// Runs a tool and wraps its result for MCP. While a mandate exists, a
+/// successful result gets the one-line mandate header as its own leading
+/// text block, so the tool's JSON stays exactly what it would be without a
+/// mandate; errors carry no header. Shared by stdio and hosted mode.
 async fn call_tool(
     client: &NubiClient,
     name: &str,
@@ -1526,17 +1615,17 @@ async fn call_tool(
     }
 
     let result = handle_tool_call(client, name, args, config, subscriptions, notify_tx).await;
-    let (mut text, is_error) = match result {
+    let (text, is_error) = match result {
         Ok(v) => (serde_json::to_string_pretty(&v).unwrap(), false),
         Err(e) => (format!("Error: {}", e), true),
     };
 
-    if !is_mandate_tool {
-        if let Some(header) = client.mandate.lock().await.header() {
-            text = format!("{}\n{}", header, text);
-        }
-    }
-    tool_text_result(text, is_error)
+    let header = if is_mandate_tool || is_error {
+        None
+    } else {
+        client.mandate.lock().await.header()
+    };
+    tool_text_result_with_header(header, text, is_error)
 }
 
 async fn handle_request(
@@ -1687,7 +1776,18 @@ fn rpc_err(id: Value, code: i32, message: String) -> JsonRpcResponse {
 }
 
 fn tool_text_result(text: String, is_error: bool) -> Value {
-    let mut v = json!({ "content": [{ "type": "text", "text": text }] });
+    tool_text_result_with_header(None, text, is_error)
+}
+
+/// A tool result whose body is `text`, preceded by `header` as a separate
+/// text block when there is one.
+fn tool_text_result_with_header(header: Option<String>, text: String, is_error: bool) -> Value {
+    let mut content = Vec::new();
+    if let Some(header) = header {
+        content.push(json!({ "type": "text", "text": header }));
+    }
+    content.push(json!({ "type": "text", "text": text }));
+    let mut v = json!({ "content": content });
     if is_error {
         v["isError"] = json!(true);
     }
@@ -1702,11 +1802,27 @@ async fn handle_http_request(
     match req.method.as_str() {
         "initialize" => {
             // A token the engine rejects still gets a handshake; the error
-            // surfaces on the first tool call instead.
-            let mandate = match resolve_me(state, token).await {
-                Ok(me) => me.client(state, token).0.mandate_for_initialize().await,
-                Err(_) => None,
-            };
+            // surfaces on the first tool call instead. Resolving the token
+            // shares the mandate's time bound: either can hang on a slow
+            // engine, and the handshake must not.
+            let mandate = tokio::time::timeout(MANDATE_INIT_TIMEOUT, async {
+                let me = resolve_me(state, token).await.ok()?;
+                // A new conversation on a token that an earlier one used:
+                // whatever that one read, this model has not.
+                me.mandate.lock().await.served = None;
+                match me.client(state, token).0.fetch_mandate().await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        eprintln!("nubi: mandate unavailable at initialize: {}", e);
+                        None
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                eprintln!("nubi: mandate fetch timed out at initialize");
+                None
+            });
             rpc_ok(req.id, initialize_result(&req.params, mandate.as_ref()))
         }
         "ping" => rpc_ok(req.id, json!({})),
@@ -1791,7 +1907,7 @@ async fn run_http(addr: SocketAddr) {
     let base_url = std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let state = HttpState {
         base_url: base_url.clone(),
-        http: reqwest::Client::new(),
+        http: http_client(),
         me_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
@@ -1912,6 +2028,8 @@ async fn main() {
 mod tests {
     use super::*;
     use axum::routing::get;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type ResumeLog = Arc<Mutex<Vec<Option<String>>>>;
@@ -2148,14 +2266,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let config = Config {
+        let config = RwLock::new(Config {
             base_url: format!("http://{}", addr),
             token: "t".into(),
             space_id: "s".into(),
             agent_id: None,
             token_file: None,
             subscribe: None,
-        };
+        });
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         stream_once(
@@ -2319,8 +2437,9 @@ mod tests {
             .iter()
             .map(|r| r["id"].as_str().unwrap())
             .collect();
-        // `kind` is an object; the old filter compared it to "skill" and
-        // returned nothing.
+        // master sent `?kind=skill` and trusted the engine to filter; an
+        // engine that ignores the parameter returned every room. `kind` is
+        // a tagged object, so the local check compares `kind.type`.
         assert_eq!(ids, vec!["s1", "s2"]);
         assert_eq!(queries.lock().await[0], "kind=skill");
     }
@@ -2346,6 +2465,20 @@ mod tests {
         if_none_match: Arc<Mutex<Vec<Option<String>>>>,
         sent: SentBodies,
         paths: Arc<Mutex<Vec<String>>>,
+        /// Run once, by the next `/mandate` request before it answers: what
+        /// a test wants to happen while that fetch is in flight.
+        mid_flight: MidFlight,
+    }
+
+    type MidFlight = Arc<Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>>;
+
+    impl MockEngine {
+        async fn while_next_fetch_is_in_flight(
+            &self,
+            f: impl Future<Output = ()> + Send + 'static,
+        ) {
+            *self.mid_flight.lock().await = Some(Box::pin(f));
+        }
     }
 
     fn mandate_body(hash: &str, content: &str) -> Value {
@@ -2381,6 +2514,9 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .map(String::from);
                         e.if_none_match.lock().await.push(inm.clone());
+                        if let Some(f) = e.mid_flight.lock().await.take() {
+                            f.await;
+                        }
                         let Some(body) = e.mandate.lock().await.clone() else {
                             return StatusCode::NOT_FOUND.into_response();
                         };
@@ -2444,17 +2580,39 @@ mod tests {
         (NubiClient::new(config.clone()), config)
     }
 
-    /// Calls a tool the way the stdio loop does and returns its text.
+    /// Calls a tool the way the stdio loop does and returns the full result.
+    async fn call_result(
+        client: &NubiClient,
+        config: &Arc<RwLock<Config>>,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        call_tool(client, name, &args, config, &subs, &tx).await
+    }
+
+    /// Calls a tool and returns the tool's own text: the last content block,
+    /// which is the JSON (or error) whether or not a mandate header leads.
     async fn call(
         client: &NubiClient,
         config: &Arc<RwLock<Config>>,
         name: &str,
         args: Value,
     ) -> String {
-        let subs: Subscriptions = Arc::default();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let result = call_tool(client, name, &args, config, &subs, &tx).await;
-        result["content"][0]["text"].as_str().unwrap().to_string()
+        let result = call_result(client, config, name, args).await;
+        let blocks = result["content"].as_array().unwrap();
+        blocks.last().unwrap()["text"].as_str().unwrap().to_string()
+    }
+
+    /// The text blocks of a tool result.
+    fn texts(result: &Value) -> Vec<&str> {
+        result["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect()
     }
 
     #[tokio::test]
@@ -2482,17 +2640,18 @@ mod tests {
         let body = client.get_mandate().await.unwrap();
         assert_eq!(body["mandate"], Value::Null);
 
-        let text = call(
+        let result = call_result(
             &client,
             &config,
             "nubi_send",
             json!({ "room_id": "r1", "text": "hi" }),
         )
         .await;
-        assert!(
-            !text.starts_with("[mandate"),
+        assert_eq!(
+            texts(&result).len(),
+            1,
             "no header without a mandate: {}",
-            text
+            result
         );
         assert!(engine.sent.lock().await[0].get("metadata").is_none());
     }
@@ -2525,35 +2684,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn header_is_prepended_only_while_a_mandate_exists() {
+    async fn header_is_a_separate_block_before_untouched_json() {
         let (base, _engine) =
             spawn_engine(Some(mandate_body("sha256:0123456789abcdef", "x"))).await;
         let (client, config) = stdio_client(&base);
 
-        let unread = call(&client, &config, "nubi_list_rooms", json!({})).await;
-        let first_line = unread.lines().next().unwrap();
+        let unread = call_result(&client, &config, "nubi_list_rooms", json!({})).await;
         assert_eq!(
-            first_line,
-            "[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]"
+            texts(&unread),
+            vec![
+                "[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]",
+                "[]"
+            ],
+            "the header leads as its own block; the JSON block is byte-identical"
+        );
+        assert!(unread.get("isError").is_none());
+
+        let body = call_result(&client, &config, "nubi_get_mandate", json!({})).await;
+        assert_eq!(texts(&body).len(), 1, "nubi_get_mandate carries no header");
+        assert!(texts(&body)[0].starts_with('{'));
+
+        let read = call_result(&client, &config, "nubi_list_rooms", json!({})).await;
+        assert_eq!(
+            texts(&read),
+            vec!["[mandate hash sha256:0123456789ab]", "[]"]
         );
 
-        let body = call(&client, &config, "nubi_get_mandate", json!({})).await;
-        assert!(
-            body.starts_with('{'),
-            "nubi_get_mandate carries no header: {}",
-            body
-        );
-
-        let read = call(&client, &config, "nubi_list_rooms", json!({})).await;
-        assert_eq!(
-            read.lines().next().unwrap(),
-            "[mandate hash sha256:0123456789ab]"
-        );
+        // Errors are not where the header belongs.
+        let err = call_result(&client, &config, "nubi_get_skill", json!({})).await;
+        assert_eq!(err["isError"], true);
+        assert_eq!(texts(&err), vec!["Error: room_id required"]);
 
         let (base, _engine) = spawn_engine(None).await;
         let (client, config) = stdio_client(&base);
-        let none = call(&client, &config, "nubi_list_rooms", json!({})).await;
-        assert_eq!(none, "[]");
+        let none = call_result(&client, &config, "nubi_list_rooms", json!({})).await;
+        assert_eq!(texts(&none), vec!["[]"]);
     }
 
     #[tokio::test]
@@ -2627,14 +2792,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let config = Config {
+        let config = RwLock::new(Config {
             base_url: format!("http://{}", addr),
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("bot".into()),
             token_file: None,
             subscribe: None,
-        };
+        });
         let (tx, mut rx) = mpsc::unbounded_channel();
         stream_once(
             &reqwest::Client::new(),
@@ -2793,6 +2958,268 @@ mod tests {
                 "/v1/spaces/s/skill-sets/tier%201",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn get_mandate_marks_served_with_the_hash_it_returned_not_a_newer_one() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+        client.get_mandate().await.unwrap();
+        assert_eq!(client.mandate.lock().await.stamp(), Some("sha256:aaa"));
+
+        // While the conditional re-fetch is on the wire, the stream says the
+        // mandate moved on to B. The engine still answers 304 for A.
+        let m = client.mandate.clone();
+        engine
+            .while_next_fetch_is_in_flight(async move {
+                let event = json!({ "agent_id": "bot", "revision": 9, "hash": "sha256:bbb" });
+                apply_mandate_update(&m, Some("bot"), &event).await;
+            })
+            .await;
+        let body = client.get_mandate().await.unwrap();
+        assert_eq!(body["hash"], "sha256:aaa", "the model was shown A");
+
+        let state = client.mandate.lock().await;
+        assert_eq!(state.hash.as_deref(), Some("sha256:bbb"));
+        assert_eq!(
+            state.served.as_deref(),
+            Some("sha256:aaa"),
+            "served must be the hash of the body returned, never the newer one"
+        );
+        assert_eq!(state.stamp(), None, "A is no longer current, so no stamp");
+        assert!(state.checked_at.is_none(), "next tool call must re-resolve");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_that_lost_the_race_does_not_overwrite_newer_state() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+
+        // First ever fetch; B is announced before the (slow) A response lands.
+        let m = client.mandate.clone();
+        engine
+            .while_next_fetch_is_in_flight(async move {
+                let event = json!({ "agent_id": "bot", "revision": 2, "hash": "sha256:bbb" });
+                apply_mandate_update(&m, Some("bot"), &event).await;
+            })
+            .await;
+        let body = client.get_mandate().await.unwrap();
+        assert_eq!(body["hash"], "sha256:aaa");
+        {
+            let state = client.mandate.lock().await;
+            assert_eq!(state.hash.as_deref(), Some("sha256:bbb"), "A must not win");
+            assert!(state.body.is_none(), "a stale body is not cached");
+            assert_eq!(state.stamp(), None);
+            assert!(state.checked_at.is_none());
+        }
+
+        // Once the engine serves B, everything lines up again.
+        *engine.mandate.lock().await = Some(mandate_body("sha256:bbb", "y"));
+        client.get_mandate().await.unwrap();
+        assert_eq!(client.mandate.lock().await.stamp(), Some("sha256:bbb"));
+    }
+
+    #[tokio::test]
+    async fn a_304_after_the_body_was_dropped_refetches_instead_of_erroring() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+        client.get_mandate().await.unwrap();
+
+        // A parallel check saw 404 and emptied the cache while this
+        // conditional request was in flight; the engine answers it 304.
+        let m = client.mandate.clone();
+        engine
+            .while_next_fetch_is_in_flight(async move { m.lock().await.set_absent() })
+            .await;
+        let body = client.fetch_mandate().await.unwrap();
+        assert_eq!(body.unwrap()["hash"], "sha256:aaa");
+        assert_eq!(
+            *engine.if_none_match.lock().await,
+            vec![None, Some("\"sha256:aaa\"".to_string()), None],
+            "a 304 with nothing cached is followed by one unconditional fetch"
+        );
+        assert_eq!(
+            client.mandate.lock().await.hash.as_deref(),
+            Some("sha256:aaa")
+        );
+    }
+
+    #[tokio::test]
+    async fn mandate_update_without_a_hash_keeps_the_mandate_but_clears_the_stamp() {
+        let (base, _engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
+        let (client, _) = stdio_client(&base);
+        client.get_mandate().await.unwrap();
+
+        let note = apply_mandate_update(
+            &client.mandate,
+            Some("bot"),
+            &json!({ "agent_id": "bot", "revision": 4 }),
+        )
+        .await;
+        assert!(note.is_some(), "the model is still told to re-read");
+
+        let state = client.mandate.lock().await;
+        assert_eq!(state.hash.as_deref(), Some("sha256:aaa"), "hash is kept");
+        assert!(state.has_mandate(), "the header keeps showing");
+        assert_eq!(state.stamp(), None);
+        assert!(state.checked_at.is_none());
+        assert_eq!(state.revision, Some(4));
+    }
+
+    #[tokio::test]
+    async fn mandate_updates_are_ignored_until_self_is_known() {
+        // Connection 1 arrives before /v1/me has answered; connection 2 after.
+        let bodies = [
+            format!(
+                "event: mandate_update\ndata: {}\n\nevent: mandate_update\ndata: {}\n\n",
+                json!({ "agent_id": "someone-else", "revision": 3, "hash": "sha256:zzz" }),
+                json!({ "agent_id": "bot", "revision": 8, "hash": "sha256:bbb" })
+            ),
+            format!(
+                "event: mandate_update\ndata: {}\n\nevent: mandate_update\ndata: {}\n\n",
+                json!({ "agent_id": "someone-else", "revision": 5, "hash": "sha256:yyy" }),
+                json!({ "agent_id": "bot", "revision": 9, "hash": "sha256:ccc" })
+            ),
+        ];
+        let connections = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/v1/spaces/{space}/stream",
+                get(|State(n): State<Arc<AtomicUsize>>| async move {
+                    let i = n.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(bodies[i.min(1)].clone()))
+                        .unwrap()
+                }),
+            )
+            .with_state(connections);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = Arc::new(RwLock::new(Config {
+            base_url: format!("http://{}", addr),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: None,
+            token_file: None,
+            subscribe: None,
+        }));
+        let mandate: Arc<Mutex<MandateState>> = Arc::default();
+        mandate
+            .lock()
+            .await
+            .set_resolved(mandate_body("sha256:aaa", "x"), None);
+        mandate.lock().await.served = Some("sha256:aaa".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        stream_once(
+            &reqwest::Client::new(),
+            &config,
+            &Target::Space,
+            true,
+            &mut None,
+            &tx,
+            &mandate,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing is applied while we do not know who we are"
+        );
+        {
+            let state = mandate.lock().await;
+            assert_eq!(state.stamp(), Some("sha256:aaa"));
+            assert!(state.checked_at.is_some());
+        }
+
+        // initialize resolved /v1/me in the meantime; the same stream picks
+        // that up without reconnecting on a fresh config.
+        config.write().await.agent_id = Some("bot".into());
+        stream_once(
+            &reqwest::Client::new(),
+            &config,
+            &Target::Space,
+            true,
+            &mut None,
+            &tx,
+            &mandate,
+        )
+        .await;
+        drop(tx);
+        let note = rx.recv().await.expect("own update applied once known");
+        assert_eq!(note["params"]["meta"]["hash"], "sha256:ccc");
+        assert!(
+            rx.recv().await.is_none(),
+            "the other agent's is still ignored"
+        );
+        assert_eq!(mandate.lock().await.hash.as_deref(), Some("sha256:ccc"));
+    }
+
+    #[tokio::test]
+    async fn hosted_initialize_starts_a_new_conversation_unstamped() {
+        let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "Be kind."))).await;
+        let state = HttpState {
+            base_url: base,
+            http: reqwest::Client::new(),
+            me_cache: Arc::default(),
+        };
+        let rpc = |method: &str, params: Value| JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: method.into(),
+            params,
+        };
+        let send = json!({ "name": "nubi_send", "arguments": { "room_id": "r1", "text": "hi" } });
+        let read = json!({ "name": "nubi_get_mandate", "arguments": {} });
+
+        handle_http_request(&state, "tok", rpc("initialize", json!({}))).await;
+        handle_http_request(&state, "tok", rpc("tools/call", read.clone())).await;
+        handle_http_request(&state, "tok", rpc("tools/call", send.clone())).await;
+
+        // The same token opens another conversation: the mandate is in the
+        // instructions again, but this model has not read it.
+        handle_http_request(&state, "tok", rpc("initialize", json!({}))).await;
+        handle_http_request(&state, "tok", rpc("tools/call", send.clone())).await;
+        handle_http_request(&state, "tok", rpc("tools/call", read)).await;
+        handle_http_request(&state, "tok", rpc("tools/call", send)).await;
+
+        let sent = engine.sent.lock().await;
+        assert_eq!(sent[0]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert!(
+            sent[1].get("metadata").is_none(),
+            "a new conversation must not inherit the stamp: {}",
+            sent[1]
+        );
+        assert_eq!(sent[2]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+    }
+
+    #[tokio::test]
+    async fn hosted_initialize_is_bounded_when_the_engine_hangs() {
+        // Accepts connections into the backlog and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = HttpState {
+            base_url: format!("http://{}", addr),
+            http: http_client(),
+            me_cache: Arc::default(),
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(1),
+            method: "initialize".into(),
+            params: json!({}),
+        };
+
+        let started = Instant::now();
+        let resp = handle_http_request(&state, "tok", req).await;
+        assert!(
+            started.elapsed() < MANDATE_INIT_TIMEOUT + Duration::from_secs(2),
+            "resolving the token must sit inside the initialize time bound"
+        );
+        assert_eq!(resp.result.unwrap()["instructions"], BASE_INSTRUCTIONS);
+        drop(listener);
     }
 
     #[test]

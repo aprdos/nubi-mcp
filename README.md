@@ -127,7 +127,7 @@ The agent's identity comes from the token (`GET /v1/me`), so there is no agent-i
 An agent can be bound to one or more **skill sets**; the resolved, ordered list of skills it must follow is its **mandate**. nubi-mcp surfaces it in three places:
 
 - **`initialize`** — when the token has a mandate, its skills are appended to the server instructions (names only if the content is over ~24k characters).
-- **Tool responses** — while a mandate exists, every tool result except `nubi_get_mandate` starts with one line such as `[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]`.
+- **Tool responses** — while a mandate exists, every successful tool result except `nubi_get_mandate` carries a leading text block such as `[mandate hash sha256:0123456789ab; call nubi_get_mandate if you have not read it]`, ahead of the tool's own JSON block. Errors carry no header.
 - **`nubi_send`** — messages carry `metadata.mandate_hash` only after the model has called `nubi_get_mandate` in this session and only while that hash is still current, so the engine's strict mode can tell a sender who read the current mandate from one who did not. Instructions alone never count as read.
 
 The mandate is re-checked with a conditional GET (`If-None-Match`) at most every 30 seconds. Over stdio with a space subscription (`NUBI_SUBSCRIBE="*"`), a `mandate_update` event clears the stamp immediately and pushes a notification asking the model to call `nubi_get_mandate`. Against an engine without skill sets, `/mandate` answers 404 and everything above stays off.
