@@ -40,7 +40,6 @@ Add to `~/.claude/settings.json`:
         "NUBI_URL": "http://your-server:9099",
         "NUBI_TOKEN": "nubi_xxx",
         "NUBI_SPACE": "your-space",
-        "NUBI_AGENT": "your-agent",
         "NUBI_SUBSCRIBE": "*"
       }
     }
@@ -92,8 +91,9 @@ Each agent gets its own nubi-mcp instance with its own identity (token). Message
 | `NUBI_URL` | Yes | Nubi server URL |
 | `NUBI_TOKEN` | Yes | Agent API token |
 | `NUBI_SPACE` | Yes | Space ID |
-| `NUBI_AGENT` | Yes | Agent ID (your identity) |
 | `NUBI_SUBSCRIBE` | No | Auto-subscribe on start (`*` = all rooms) |
+
+The agent's identity comes from the token (`GET /v1/me`), so there is no agent-id variable.
 
 ---
 
@@ -183,7 +183,7 @@ For unfiltered streams, call `nubi_subscribe` with `mentioned_only: false`.
 Run as a standalone HTTP server instead of stdio:
 
 ```bash
-nubi-mcp --http 8089
+nubi-mcp --http 127.0.0.1:8089
 ```
 
 Then configure Claude Code to use HTTP transport:
