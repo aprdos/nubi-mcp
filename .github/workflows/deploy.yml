@@ -1,0 +1,112 @@
+name: Deploy
+
+# One workflow for both hosts, driven by GitHub Environments. A push to master
+# deploys to `staging`; a manual dispatch deploys to the chosen environment
+# (`production` by default). Each environment carries its own DEPLOY_HOST and
+# DEPLOY_SSH_KEY secrets, so the steps below are identical for both.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy to
+        type: choice
+        options:
+          - production
+          - staging
+        default: production
+
+jobs:
+  deploy:
+    # Falls back to GitHub-hosted whenever USE_SELF_HOSTED is unset; without the
+    # fallback the job queues forever if no self-hosted runner is registered.
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && fromJson('["self-hosted", "linux", "x64", "nubi"]') || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    environment:
+      name: ${{ inputs.environment || 'staging' }}
+    # Never cancel a deploy mid-swap: a half-finished one could leave the host
+    # with no binary at all. Queued runs for the same environment wait.
+    concurrency:
+      group: deploy-${{ inputs.environment || 'staging' }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The self-hosted AL2023 image ships openssh-clients but not rsync.
+      - name: Ensure rsync
+        run: |
+          if command -v rsync >/dev/null; then
+            exit 0
+          elif command -v dnf >/dev/null; then
+            sudo dnf install -y rsync
+          else
+            sudo apt-get update && sudo apt-get install -y rsync
+          fi
+
+      # The build happens on the runner, not on the serving host: the host
+      # cannot resolve github.com and is too small to compile comfortably.
+      # Binaries built on AL2023 (glibc 2.34) or ubuntu-latest run on the
+      # Debian 13 hosts. The AL2023 image has no C compiler, which cc-rs and
+      # build scripts need.
+      - name: Install gcc
+        if: vars.USE_SELF_HOSTED == 'true'
+        run: sudo dnf install -y gcc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      # Only the binary goes to the host. It lands under a new name because a
+      # running binary cannot be overwritten in place (ETXTBSY); the swap below
+      # uses mv, which replaces the directory entry instead of the file.
+      - name: Ship binary
+        run: |
+          rsync -avz \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            target/release/nubi-mcp admin@${{ secrets.DEPLOY_HOST }}:~/nubi-mcp.new
+
+      - name: Swap and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key admin@${{ secrets.DEPLOY_HOST }} << 'EOF'
+            set -e
+
+            echo "==> Swapping binary..."
+            mv ~/nubi-mcp ~/nubi-mcp.rollback 2>/dev/null || true
+            mv ~/nubi-mcp.new ~/nubi-mcp
+            chmod +x ~/nubi-mcp
+
+            echo "==> Restarting nubi-mcp..."
+            sudo systemctl restart nubi-mcp
+            sleep 3
+
+            if curl -sf http://127.0.0.1:8089/healthz > /dev/null; then
+              echo "==> Deploy successful!"
+            else
+              echo "==> ERROR: health check failed"
+              sudo systemctl status nubi-mcp --no-pager || true
+              sudo journalctl -u nubi-mcp -n 30 --no-pager || true
+              exit 1
+            fi
+          EOF
