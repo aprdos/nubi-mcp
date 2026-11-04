@@ -1358,7 +1358,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_poll",
-                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. To read older history, pass before_index to walk backwards.",
+                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. Returns {messages: [{index, from, at, text, mentions, expect_reply}], has_more, next_index, first_index}, about 4000 tokens at most unless you pass max_tokens. When has_more is true, call again with from_index=next_index; to read older history, pass before_index=first_index.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1524,6 +1524,7 @@ async fn handle_tool_call(
                     wait_ms,
                 )
                 .await
+                .map(compact_poll)
         }
         "nubi_search" => {
             let query = args["query"].as_str().ok_or("query required")?;
@@ -1616,7 +1617,8 @@ async fn call_tool(
 
     let result = handle_tool_call(client, name, args, config, subscriptions, notify_tx).await;
     let (text, is_error) = match result {
-        Ok(v) => (serde_json::to_string_pretty(&v).unwrap(), false),
+        // Compact: the model reads it fine, and indentation is pure cost.
+        Ok(v) => (serde_json::to_string(&v).unwrap(), false),
         Err(e) => (format!("Error: {}", e), true),
     };
 
@@ -1773,6 +1775,119 @@ fn rpc_err(id: Value, code: i32, message: String) -> JsonRpcResponse {
         result: None,
         error: Some(JsonRpcError { code, message }),
     }
+}
+
+/// The engine's poll response, trimmed to what a model reads: per message
+/// its index, sender, time, text and routing. Dropped: the per-message id,
+/// payload type, token count, the parts nesting around plain text, and
+/// bookkeeping metadata (usage, mandate hash). Anything not recognised is
+/// kept, so a new field is never silently lost.
+fn compact_poll(v: Value) -> Value {
+    let Some(entries) = v.get("entries").and_then(Value::as_array) else {
+        return v;
+    };
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "messages".into(),
+        Value::Array(entries.iter().map(compact_entry).collect()),
+    );
+    for key in ["has_more", "next_index", "first_index"] {
+        if let Some(value) = v.get(key) {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+fn compact_entry(e: &Value) -> Value {
+    const KNOWN: [&str; 5] = [
+        "global_index",
+        "sender",
+        "timestamp_ms",
+        "payload",
+        "token_count",
+    ];
+    const NOISE: [&str; 2] = ["usage", "mandate_hash"];
+    let mut m = serde_json::Map::new();
+    m.insert("index".into(), e["global_index"].clone());
+    m.insert("from".into(), e["sender"].clone());
+    if let Some(ts) = e["timestamp_ms"].as_u64() {
+        m.insert("at".into(), Value::String(iso_utc(ts)));
+    }
+    let payload = &e["payload"];
+    match payload["type"].as_str() {
+        Some("message") | None => {
+            let parts = payload["parts"].as_array();
+            let plain = parts.is_none_or(|ps| ps.iter().all(|p| p["kind"] == "text"));
+            if plain {
+                let text: String = parts
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p["text"].as_str())
+                    .collect();
+                m.insert("text".into(), Value::String(text));
+            } else {
+                m.insert("parts".into(), payload["parts"].clone());
+            }
+            if let Some(mentions) = payload["mentions"].as_array().filter(|a| !a.is_empty()) {
+                m.insert("mentions".into(), Value::Array(mentions.clone()));
+            }
+            let mut rest = serde_json::Map::new();
+            for (k, val) in payload["metadata"].as_object().into_iter().flatten() {
+                match k.as_str() {
+                    "expect_reply" | "no_reply" => {
+                        m.insert(k.clone(), val.clone());
+                    }
+                    k if NOISE.contains(&k) => {}
+                    _ => {
+                        rest.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+            if !rest.is_empty() {
+                m.insert("metadata".into(), Value::Object(rest));
+            }
+            for (k, val) in payload.as_object().into_iter().flatten() {
+                if !["type", "parts", "mentions", "metadata", "message_id"].contains(&k.as_str()) {
+                    m.insert(k.clone(), val.clone());
+                }
+            }
+        }
+        // System entries (member_joined, ...): say what happened.
+        Some(_) => {
+            let mut event = payload.as_object().cloned().unwrap_or_default();
+            event.remove("type");
+            m.insert("event".into(), Value::Object(event));
+        }
+    }
+    for (k, val) in e.as_object().into_iter().flatten() {
+        if !KNOWN.contains(&k.as_str()) {
+            m.insert(k.clone(), val.clone());
+        }
+    }
+    Value::Object(m)
+}
+
+/// `2026-11-03T08:47:02Z` for a Unix time in milliseconds.
+fn iso_utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 fn tool_text_result(text: String, is_error: bool) -> Value {
@@ -2027,6 +2142,60 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_utc_formats_unix_millis() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(951_782_400_000), "2000-02-29T00:00:00Z");
+        assert_eq!(iso_utc(1_793_370_422_730), "2026-10-30T14:27:02Z");
+    }
+
+    /// A real poll entry shape from the engine, compacted.
+    #[test]
+    fn poll_results_keep_what_the_model_reads() {
+        let engine = json!({
+            "entries": [
+                {"global_index": 285, "sender": "palm", "timestamp_ms": 1_793_370_422_730u64,
+                 "token_count": 65,
+                 "payload": {"type": "message", "message_id": "b8e37b49-6a9f-4560-a3e3-293f36870793",
+                    "mentions": ["grape"],
+                    "metadata": {"expect_reply": [], "usage": {"x": 1}, "mandate_hash": "h", "thread": "t1"},
+                    "parts": [{"kind": "text", "text": "Reviewed "}, {"kind": "text", "text": "PR #101."}]}},
+                {"global_index": 286, "sender": "system", "timestamp_ms": 1_793_370_422_731u64,
+                 "token_count": 16,
+                 "payload": {"type": "system", "kind": "member_joined", "agent_id": "melon"}},
+                {"global_index": 287, "sender": "ada", "timestamp_ms": 0, "token_count": 3,
+                 "payload": {"type": "message", "message_id": "m", "mentions": [],
+                    "parts": [{"kind": "image", "url": "u"}]}}
+            ],
+            "from_index": 285, "next_index": 288, "first_index": 285, "tokens_used": 84, "has_more": true
+        });
+        let compact = compact_poll(engine.clone());
+        assert_eq!(
+            compact,
+            json!({
+                "messages": [
+                    {"index": 285, "from": "palm", "at": "2026-10-30T14:27:02Z",
+                     "text": "Reviewed PR #101.", "mentions": ["grape"], "expect_reply": [],
+                     "metadata": {"thread": "t1"}},
+                    {"index": 286, "from": "system", "at": "2026-10-30T14:27:02Z",
+                     "event": {"kind": "member_joined", "agent_id": "melon"}},
+                    {"index": 287, "from": "ada", "at": "1970-01-01T00:00:00Z",
+                     "parts": [{"kind": "image", "url": "u"}]}
+                ],
+                "has_more": true, "next_index": 288, "first_index": 285
+            })
+        );
+        let before = serde_json::to_string_pretty(&engine).unwrap().len();
+        let after = serde_json::to_string(&compact).unwrap().len();
+        assert!(after * 2 < before, "{after} vs {before}");
+    }
+
+    #[test]
+    fn a_poll_result_without_entries_is_left_alone() {
+        let v = json!({"error": "nope"});
+        assert_eq!(compact_poll(v.clone()), v);
+    }
     use axum::routing::get;
     use std::future::Future;
     use std::pin::Pin;
@@ -2949,7 +3118,7 @@ mod tests {
             json!({ "set_id": "tier 1" }),
         )
         .await;
-        assert!(set.contains("\"id\": \"tier1\""));
+        assert!(set.contains("\"id\":\"tier1\""));
         assert_eq!(
             *engine.paths.lock().await,
             vec![
