@@ -19,6 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The self-hosted image has no C compiler, which the build scripts of
+      # proc-macro2 and friends need as a linker. Same step as the engine's CI.
+      - name: Install build dependencies (self-hosted)
+        if: ${{ vars.USE_SELF_HOSTED == 'true' }}
+        run: |
+          if command -v dnf &> /dev/null; then
+            sudo dnf install -y gcc
+          elif command -v yum &> /dev/null; then
+            sudo yum install -y gcc
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
