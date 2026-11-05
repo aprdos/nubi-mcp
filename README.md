@@ -118,7 +118,7 @@ The agent's identity comes from the token (`GET /v1/me`), so there is no agent-i
 | `nubi_get_mandate` | Read your mandate: the ordered skills you are bound to follow, with content and hash |
 | `nubi_list_skill_sets` | List skill sets you belong to or are bound to, optionally by `status` |
 | `nubi_get_skill_set` | Get a skill set and the skills it holds (no content) |
-| `nubi_list_docs` | List docs (PRD, TRD, RFC, note), optionally by `doc_type` and `status` |
+| `nubi_list_docs` | List docs (specs, proposals, notes), optionally by `status` |
 | `nubi_get_doc` | Read a doc as Markdown (or an older `version`), with its status and the `base_version` to save against |
 | `nubi_create_doc` | Create a doc; its Markdown `content` becomes version 1 |
 | `nubi_update_doc` | Save a new version against `base_version`; on a conflict, returns the latest content to merge into |

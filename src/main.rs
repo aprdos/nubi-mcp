@@ -584,16 +584,12 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    /// Doc rooms the caller belongs to, optionally narrowed by type and
-    /// status, in a compact shape: what an agent needs to pick one.
-    async fn list_docs(
-        &self,
-        doc_type: Option<&str>,
-        status: Option<&str>,
-    ) -> Result<Value, String> {
+    /// Doc rooms the caller belongs to, optionally narrowed by status, in a
+    /// compact shape: what an agent needs to pick one.
+    async fn list_docs(&self, status: Option<&str>) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms?kind=doc", self.space_id().await);
         let rooms = self.request(reqwest::Method::GET, &path, None).await?;
-        Ok(compact_doc_list(rooms, doc_type, status))
+        Ok(compact_doc_list(rooms, status))
     }
 
     /// A doc's current content, or the version at `version` (a message index
@@ -613,12 +609,11 @@ impl NubiClient {
     async fn create_doc(
         &self,
         name: &str,
-        doc_type: &str,
         content: Option<&str>,
         description: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        let mut body = json!({ "name": name, "room_type": "doc", "doc_type": doc_type });
+        let mut body = json!({ "name": name, "room_type": "doc" });
         if let Some(c) = content.filter(|c| !c.trim().is_empty()) {
             body["content"] = json!(c);
         }
@@ -632,7 +627,6 @@ impl NubiClient {
         Ok(json!({
             "room_id": meta["id"],
             "name": meta["name"],
-            "doc_type": kind["doc_type"],
             "status": kind["status"],
             "base_version": kind["current_version"],
             "version_count": kind["version_count"],
@@ -1358,21 +1352,19 @@ fn initialize_result(params: &Value, mandate: Option<&Value>) -> Value {
     })
 }
 
-/// Doc rooms from a room list, narrowed by type and status. Filters
-/// locally too: an engine without `?kind=doc` returns every room.
-fn compact_doc_list(rooms: Value, doc_type: Option<&str>, status: Option<&str>) -> Value {
+/// Doc rooms from a room list, narrowed by status. Filters locally too: an
+/// engine without `?kind=doc` returns every room.
+fn compact_doc_list(rooms: Value, status: Option<&str>) -> Value {
     let docs: Vec<Value> = rooms
         .as_array()
         .map(|all| {
             all.iter()
                 .filter(|r| r["kind"]["type"] == "doc")
-                .filter(|r| doc_type.is_none_or(|t| r["kind"]["doc_type"] == t))
                 .filter(|r| status.is_none_or(|s| r["kind"]["status"] == s))
                 .map(|r| {
                     json!({
                         "room_id": r["id"],
                         "name": r["name"],
-                        "doc_type": r["kind"]["doc_type"],
                         "status": r["kind"]["status"],
                         "version_count": r["kind"]["version_count"],
                         "updated_at_ms": r["kind"]["updated_at_ms"],
@@ -1395,7 +1387,6 @@ fn compact_doc(doc: &Value) -> Value {
     json!({
         "room_id": doc["room"]["id"],
         "name": doc["room"]["name"],
-        "doc_type": kind["doc_type"],
         "status": kind["status"],
         "reviewers": kind["reviewers"],
         "version": version["number"],
@@ -1476,18 +1467,17 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_list_docs",
-                "description": "List docs you can read: PRDs, TRDs, RFCs and notes, written and reviewed by people and agents. Each has a review status (draft, in_review, approved, archived).",
+                "description": "List docs you can read: specs, proposals and notes written and reviewed by people and agents. Each has a review status (draft, in_review, approved, archived).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "doc_type": { "type": "string", "enum": ["prd", "trd", "rfc", "note"], "description": "Only docs of this type" },
                         "status": { "type": "string", "enum": ["draft", "in_review", "approved", "archived"], "description": "Only docs in this status" }
                     }
                 }
             },
             {
                 "name": "nubi_get_doc",
-                "description": "Read a doc as Markdown, with its type, review status and version. Use an approved doc as the source of truth for what to build. Returns base_version, which nubi_update_doc needs. Discussion about the doc happens in its room (nubi_poll, nubi_send).",
+                "description": "Read a doc as Markdown, with its review status and version. Use an approved doc as the source of truth for what to build. Returns base_version, which nubi_update_doc needs. Discussion about the doc happens in its room (nubi_poll, nubi_send).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1499,16 +1489,15 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_doc",
-                "description": "Create a doc (for example a PRD drafted from a conversation). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval.",
+                "description": "Create a doc (for example a spec drafted from a conversation). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The doc's title" },
-                        "doc_type": { "type": "string", "enum": ["prd", "trd", "rfc", "note"], "description": "What the doc is for" },
                         "content": { "type": "string", "description": "The doc as Markdown: headings, lists, checklists, tables, quotes, code and links" },
                         "description": { "type": "string", "description": "One line on what the doc covers (optional)" }
                     },
-                    "required": ["name", "doc_type"]
+                    "required": ["name"]
                 }
             },
             {
@@ -1686,25 +1675,15 @@ async fn handle_tool_call(
             let set_id = args["set_id"].as_str().ok_or("set_id required")?;
             client.get_skill_set(set_id).await
         }
-        "nubi_list_docs" => {
-            client
-                .list_docs(args["doc_type"].as_str(), args["status"].as_str())
-                .await
-        }
+        "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_get_doc" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_doc(room_id, args["version"].as_u64()).await
         }
         "nubi_create_doc" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let doc_type = args["doc_type"].as_str().ok_or("doc_type required")?;
             client
-                .create_doc(
-                    name,
-                    doc_type,
-                    args["content"].as_str(),
-                    args["description"].as_str(),
-                )
+                .create_doc(name, args["content"].as_str(), args["description"].as_str())
                 .await
         }
         "nubi_update_doc" => {
@@ -3678,7 +3657,7 @@ mod tests {
         json!({
             "id": "prd", "name": "Pricing",
             "kind": {
-                "type": "doc", "doc_type": "prd", "status": d.status,
+                "type": "doc", "status": d.status,
                 "current_version": current, "version_count": d.versions.len(),
                 "approved_version": d.approved, "reviewers": ["reviewer"]
             }
@@ -3710,7 +3689,7 @@ mod tests {
                     let d = s.lock().await;
                     axum::Json(json!([
                         doc_meta(&d),
-                        { "id": "rfc", "name": "Sessions", "kind": { "type": "doc", "doc_type": "rfc", "status": "approved" } },
+                        { "id": "rfc", "name": "Sessions", "kind": { "type": "doc", "status": "approved" } },
                         { "id": "general", "name": "general", "kind": { "type": "group" } }
                     ]))
                 })
@@ -3721,7 +3700,7 @@ mod tests {
                     (StatusCode::CREATED, axum::Json(json!({
                         "id": "new-doc", "name": body["name"],
                         "kind": {
-                            "type": "doc", "doc_type": body["doc_type"], "status": "draft",
+                            "type": "doc", "status": "draft",
                             "current_version": if has_content { json!(0) } else { Value::Null },
                             "version_count": if has_content { 1 } else { 0 }
                         }
@@ -3789,9 +3768,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_docs_keeps_docs_and_filters_by_type_and_status() {
+    async fn list_docs_keeps_docs_and_filters_by_status() {
         let (client, _) = spawn_doc_engine(two_versions()).await;
-        let all = client.list_docs(None, None).await.unwrap();
+        let all = client.list_docs(None).await.unwrap();
         let ids: Vec<&str> = all
             .as_array()
             .unwrap()
@@ -3799,10 +3778,7 @@ mod tests {
             .map(|d| d["room_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["prd", "rfc"], "the group room is not a doc");
-
-        let rfcs = client.list_docs(Some("rfc"), None).await.unwrap();
-        assert_eq!(rfcs.as_array().unwrap().len(), 1);
-        let approved = client.list_docs(None, Some("approved")).await.unwrap();
+        let approved = client.list_docs(Some("approved")).await.unwrap();
         assert_eq!(approved[0]["room_id"], "rfc");
         assert_eq!(all[0]["version_count"], 2);
     }
@@ -3875,24 +3851,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_doc_sends_the_type_and_first_version() {
+    async fn create_doc_sends_the_first_version() {
         let (client, state) = spawn_doc_engine(two_versions()).await;
         let created = client
-            .create_doc("Rollout", "trd", Some("## Context\n"), None)
+            .create_doc("Rollout", Some("## Context\n"), None)
             .await
             .unwrap();
         assert_eq!(created["room_id"], "new-doc");
-        assert_eq!(created["doc_type"], "trd");
         assert_eq!(created["base_version"], 0);
         let sent = state.lock().await.created[0].clone();
         assert_eq!(sent["room_type"], "doc");
         assert_eq!(sent["content"], "## Context\n");
 
         // Blank content is left out, so the doc starts with no version
-        client
-            .create_doc("Notes", "note", Some("   "), None)
-            .await
-            .unwrap();
+        client.create_doc("Notes", Some("   "), None).await.unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
     }
 }
