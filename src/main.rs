@@ -3817,6 +3817,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_doc_approved_before_any_content_counts_as_changed_once_written() {
+        // Approved with no versions: the engine records no approved_version.
+        // Content written since then was never approved.
+        let mut doc = two_versions();
+        doc.status = "approved";
+        doc.approved = None;
+        let (client, _) = spawn_doc_engine(doc).await;
+        let read = client.get_doc("prd", None).await.unwrap();
+        assert_eq!(read["changed_since_approval"], true);
+
+        // With no versions at all there is nothing to have changed
+        let empty = compact_doc(&json!({
+            "room": { "id": "d", "name": "D", "kind": { "type": "doc", "status": "approved" } },
+            "content": "",
+            "version": null
+        }));
+        assert_eq!(empty["changed_since_approval"], false);
+    }
+
+    #[tokio::test]
     async fn update_doc_saves_against_the_base_version() {
         let (client, state) = spawn_doc_engine(two_versions()).await;
         let saved = client
