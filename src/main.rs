@@ -82,6 +82,36 @@ impl Config {
 
 /// Mention ids arrive as the model typed them, so `@Manager ` and `manager`
 /// have to compare equal.
+/// handle -> agent id, from `GET /v1/spaces/{space}/agents`. A name that is
+/// some agent's id never maps elsewhere (an id wins, as in the desktop).
+fn handle_map(agents: &Value) -> HashMap<String, String> {
+    let list = agents.as_array().map(Vec::as_slice).unwrap_or_default();
+    let ids: std::collections::HashSet<&str> =
+        list.iter().filter_map(|a| a["agent_id"].as_str()).collect();
+    list.iter()
+        .filter_map(|a| {
+            let id = a["agent_id"].as_str()?;
+            let handle = a["username"].as_str().filter(|u| !u.is_empty())?;
+            (!ids.contains(handle)).then(|| (handle.to_string(), id.to_string()))
+        })
+        .collect()
+}
+
+/// Names with every known handle (with or without `@`) swapped for its
+/// agent's id. Ids, `here` and unknown names pass through; duplicates
+/// collapse, order kept.
+fn resolve_handles(names: &[String], handles: &HashMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for n in names {
+        let bare = n.trim().trim_start_matches('@');
+        let id = handles.get(bare).cloned().unwrap_or_else(|| n.clone());
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn same_agent(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.trim().trim_start_matches('@').to_lowercase();
     norm(a) == norm(b)
@@ -811,6 +841,20 @@ impl NubiClient {
             room_id
         );
         let message_id = uuid::Uuid::new_v4().to_string();
+
+        // Agents answer to their id; a model often names them by @handle
+        // (`pine` for `pine-u3cg`), which wakes nobody. Swap known handles for
+        // ids, as the desktop and nubi-agent do. If the lookup fails the names
+        // go out as written.
+        if !mentions.is_empty() || expect_reply.as_ref().is_some_and(|e| !e.is_empty()) {
+            if let Ok(agents) = self.list_agents().await {
+                let handles = handle_map(&agents);
+                if !handles.is_empty() {
+                    mentions = resolve_handles(&mentions, &handles);
+                    expect_reply = expect_reply.map(|e| resolve_handles(&e, &handles));
+                }
+            }
+        }
 
         // Naming yourself wakes nobody — every client drops its own messages
         // before reading them — but it does read to the room as though one
@@ -2375,6 +2419,31 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn handles_become_ids() {
+        let agents = json!([
+            {"agent_id": "pine-u3cg", "username": "pine"},
+            {"agent_id": "palm-ntjy", "username": "palm"},
+            {"agent_id": "guava", "username": null},
+            {"agent_id": "x-1", "username": "guava"},
+            {"agent_id": "y", "username": ""}
+        ]);
+        let h = handle_map(&agents);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_handles(&names(&["pine", "@palm", "guava", "here", "nobody"]), &h),
+            names(&["pine-u3cg", "palm-ntjy", "guava", "here", "nobody"]),
+            "an id (guava) wins over another agent's handle"
+        );
+        assert_eq!(
+            resolve_handles(&names(&["pine", "pine-u3cg"]), &h),
+            names(&["pine-u3cg"])
+        );
+        assert!(!h.contains_key(""));
+        assert!(handle_map(&json!({"error": "x"})).is_empty());
+    }
+
     use super::*;
 
     #[test]
