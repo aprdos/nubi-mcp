@@ -87,12 +87,11 @@ fn same_agent(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
-/// A name from expect_reply as the engine accepts it in `mentions`: no `@`,
+/// A name as the engine accepts it in `mentions`: no `@`,
 /// lowercase, and the engine's id shape (`^[a-z0-9][a-z0-9_-]{0,63}$`). The
 /// engine turns a handle (`pine`, or a skill set's `reviewer`) into agent
 /// ids itself; anything else (spaces, dots, only punctuation) would get the
-/// whole message refused, so it is left to `expect_reply`, where the engine
-/// resolves or ignores it.
+/// whole message refused.
 fn mention_name(name: &str) -> Option<String> {
     let n = name.trim().trim_start_matches('@').to_lowercase();
     let mut chars = n.chars();
@@ -819,8 +818,8 @@ impl NubiClient {
         &self,
         room_id: &str,
         text: &str,
-        mut mentions: Vec<String>,
-        mut expect_reply: Option<Vec<String>>,
+        mentions: Vec<String>,
+        cc: Vec<String>,
     ) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/messages",
@@ -829,37 +828,45 @@ impl NubiClient {
         );
         let message_id = uuid::Uuid::new_v4().to_string();
 
-        // Naming yourself wakes nobody — every client drops its own messages
-        // before reading them — but it does read to the room as though one
-        // more participant had been asked. Drop it before the merge below,
-        // which would otherwise put it straight back.
-        if let Some(me) = self.self_id().await {
-            mentions.retain(|m| !same_agent(m, &me));
-            expect_reply =
-                expect_reply.map(|ids| ids.into_iter().filter(|id| !same_agent(id, &me)).collect());
-        }
-
-        // Someone named in expect_reply but not in mentions would never be
-        // delivered the message, so they could never reply.
-        if let Some(ref ids) = expect_reply {
-            for id in ids {
-                let Some(name) = mention_name(id) else {
-                    continue;
-                };
-                if !mentions.iter().any(|m| same_agent(m, &name)) {
-                    mentions.push(name);
-                }
+        // Mentions are agent ids to the engine, which refuses the whole
+        // message over one `@Apple`: write them the way it takes them (it
+        // turns handles into ids itself) and drop what can't be one. Naming
+        // yourself asks nobody, so you go too, from cc as well.
+        let me = self.self_id().await;
+        let not_me = |n: &String| me.as_deref().is_none_or(|me| !same_agent(n, me));
+        let mut to: Vec<String> = Vec::new();
+        for name in mentions
+            .iter()
+            .filter_map(|m| mention_name(m))
+            .filter(not_me)
+        {
+            if !to.contains(&name) {
+                to.push(name);
             }
         }
+        // cc gets the same treatment: the engine resolves handles in it,
+        // and anything that can't be an id or repeats goes.
+        let mut copied: Vec<String> = Vec::new();
+        for name in cc.iter().filter_map(|m| mention_name(m)).filter(not_me) {
+            // Copying everyone means nothing; `here` is only ever a To.
+            if name != "here" && !copied.contains(&name) {
+                copied.push(name);
+            }
+        }
+        // Copied wins over mentioned (the reply rules read it that way), so a
+        // name in both leaves mentions: it is seen, not asked. `here` stays,
+        // with cc carving people out of it.
+        to.retain(|n| !copied.contains(n));
+        let cc = copied;
 
         let mut body = json!({
             "message_id": message_id,
             "parts": [{ "kind": "text", "text": text }],
-            "mentions": mentions
+            "mentions": to
         });
         let mut metadata = serde_json::Map::new();
-        if let Some(ids) = expect_reply {
-            metadata.insert("expect_reply".into(), json!(ids));
+        if !cc.is_empty() {
+            metadata.insert("cc".into(), json!(cc));
         }
         // Proof for the engine that the sender read the current mandate. Only
         // a hash this session actually showed the model is ever sent.
@@ -1562,7 +1569,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_send",
-                "description": "Send a message to a room, and the only way to ask a teammate for something. A message reaches exactly the agents named in mentions: say nothing there and nobody receives it. Whenever the message is a question, a request or a handoff, name who should answer in expect_reply as well, or it lands as something everyone can leave for someone else.",
+                "description": "Send a message to a room, and the only way to ask a teammate for something. Like an email: mentions are the To, cc the Cc. Everyone you mention is woken and asked to act on it, so mention exactly who you need something from, and nobody for a note that needs no action (an FYI, a status update, an answer that closes the exchange). Writing @name in the text counts as a mention too.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1571,12 +1578,12 @@ fn tools_list_full() -> Value {
                         "mentions": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Agent ids who should see this message. Use 'here' for everyone in the room. Nobody reads a message they are not mentioned in."
+                            "description": "Agent ids you need something from: each is woken and asked to act. 'here' asks everyone in the room."
                         },
-                        "expect_reply": {
+                        "cc": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Who is on the hook to answer. Set it on every message that needs a response: [\"apple\"] puts it on apple even when you mentioned others, who then get it as context. Leave it out (or pass []) for a note nobody should reply to, like an FYI, a status update or an answer that closes the exchange: then nobody answers."
+                            "description": "Agent ids who should see this without acting on it, even if mentioned."
                         }
                     },
                     "required": ["room_id", "text"]
@@ -1584,7 +1591,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_poll",
-                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. Returns {messages: [{index, from, at, text, mentions, expect_reply}], has_more, next_index, first_index}, about 4000 tokens at most unless you pass max_tokens. When has_more is true, call again with from_index=next_index; to read older history, pass before_index=first_index.",
+                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. Returns {messages: [{index, from, at, text, mentions, cc}], has_more, next_index, first_index}, about 4000 tokens at most unless you pass max_tokens. When has_more is true, call again with from_index=next_index; to read older history, pass before_index=first_index.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1746,22 +1753,15 @@ async fn handle_tool_call(
                         .collect()
                 })
                 .unwrap_or_default();
-            // Left out means nobody is on the hook, the same as an agent's
-            // ordinary reply (nubi-agent posts those with []). Absent would let
-            // every mentioned agent answer, and two agents mentioning each
-            // other without it answer each other for ever.
-            let expect_reply: Option<Vec<String>> = match args.get("expect_reply") {
-                None | Some(Value::Null) => Some(Vec::new()),
-                Some(Value::Array(arr)) => Some(
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                ),
-                Some(_) => return Err("expect_reply must be an array of agent ids".to_string()),
+            let cc: Vec<String> = match args.get("cc") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                Some(_) => return Err("cc must be an array of agent ids".to_string()),
             };
-            client
-                .send_message(room_id, text, mentions, expect_reply)
-                .await
+            client.send_message(room_id, text, mentions, cc).await
         }
         "nubi_poll" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2091,7 +2091,7 @@ fn compact_entry(e: &Value) -> Value {
             let mut rest = serde_json::Map::new();
             for (k, val) in payload["metadata"].as_object().into_iter().flatten() {
                 match k.as_str() {
-                    "expect_reply" | "no_reply" => {
+                    "cc" | "expect_reply" | "no_reply" => {
                         m.insert(k.clone(), val.clone());
                     }
                     k if NOISE.contains(&k) => {}
@@ -2493,9 +2493,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_tool_without_expect_reply_asks_nobody() {
+    async fn the_tool_sends_mentions_as_the_to_and_cc_as_metadata() {
         let (client, sent) = spawn_message_sink().await;
-        let args = json!({"room_id": "r1", "text": "done", "mentions": ["manager"]});
+        let args = json!({
+            "room_id": "r1",
+            "text": "take this",
+            "mentions": ["@Apple", "me", "not an id", "apple", "pine", "here"],
+            "cc": ["pine", "@Me", "not an id", "@Pine", "a.b", "here"]
+        });
         let config = client.config.clone();
         let subs: Subscriptions = Arc::default();
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2503,105 +2508,22 @@ mod tests {
             .await
             .unwrap();
         let body = &sent.lock().await[0];
-        assert_eq!(body["metadata"], json!({ "expect_reply": [] }));
-        assert_eq!(body["mentions"], json!(["manager"]));
+        // Written the way the engine takes ids; yourself and non-ids dropped.
+        assert_eq!(body["mentions"], json!(["apple", "here"]));
+        assert_eq!(body["metadata"], json!({ "cc": ["pine"] }));
+        assert!(body["metadata"].get("expect_reply").is_none());
     }
 
     #[tokio::test]
-    async fn expect_reply_names_reach_mentions_in_a_form_the_engine_takes() {
+    async fn a_note_for_nobody_carries_no_metadata() {
         let (client, sent) = spawn_message_sink().await;
         client
-            .send_message(
-                "r1",
-                "review this",
-                vec!["apple".into()],
-                Some(vec![
-                    "@Apple".into(),
-                    "Reviewer".into(),
-                    "not an id".into(),
-                    "---".into(),
-                    "a.b".into(),
-                ]),
-            )
+            .send_message("r1", "done", vec![], vec![])
             .await
             .unwrap();
         let body = &sent.lock().await[0];
-        // @Apple is apple, already there; Reviewer goes in bare and
-        // lowercase for the engine to resolve; names the engine wouldn't take
-        // as an id (a space, only punctuation, a dot) stay out of mentions,
-        // where they would get the message refused.
-        assert_eq!(body["mentions"], json!(["apple", "reviewer"]));
-        assert_eq!(
-            body["metadata"],
-            json!({ "expect_reply": ["@Apple", "Reviewer", "not an id", "---", "a.b"] })
-        );
-    }
-
-    #[tokio::test]
-    async fn send_without_expect_reply_sends_no_metadata() {
-        let (client, sent) = spawn_message_sink().await;
-        client
-            .send_message("r1", "hi", vec!["manager".into()], None)
-            .await
-            .unwrap();
-
-        let body = &sent.lock().await[0];
-        assert!(
-            body.get("metadata").is_none(),
-            "absent expect_reply must not add metadata: {}",
-            body
-        );
-        assert_eq!(body["mentions"], json!(["manager"]));
-    }
-
-    #[tokio::test]
-    async fn send_with_empty_expect_reply_asks_nobody() {
-        let (client, sent) = spawn_message_sink().await;
-        client
-            .send_message("r1", "fyi", vec!["manager".into()], Some(vec![]))
-            .await
-            .unwrap();
-
-        let body = &sent.lock().await[0];
-        assert_eq!(body["metadata"], json!({ "expect_reply": [] }));
-    }
-
-    #[tokio::test]
-    async fn send_adds_expect_reply_targets_to_mentions() {
-        let (client, sent) = spawn_message_sink().await;
-        client
-            .send_message(
-                "r1",
-                "take this",
-                vec!["manager".into()],
-                Some(vec!["apple".into()]),
-            )
-            .await
-            .unwrap();
-
-        let body = &sent.lock().await[0];
-        // apple was never mentioned, so without the union it would never see
-        // the message it is being asked to answer.
-        assert_eq!(body["mentions"], json!(["manager", "apple"]));
-        assert_eq!(body["metadata"], json!({ "expect_reply": ["apple"] }));
-    }
-
-    #[tokio::test]
-    async fn send_drops_self_from_mentions_and_expect_reply() {
-        let (client, sent) = spawn_message_sink().await;
-        client
-            .send_message(
-                "r1",
-                "status",
-                vec!["banana".into(), "@Me ".into()],
-                Some(vec!["me".into(), "banana".into()]),
-            )
-            .await
-            .unwrap();
-
-        let body = &sent.lock().await[0];
-        assert_eq!(body["mentions"], json!(["banana"]));
-        assert_eq!(body["metadata"], json!({ "expect_reply": ["banana"] }));
+        assert!(body.get("metadata").is_none(), "{body}");
+        assert_eq!(body["mentions"], json!([]));
     }
 
     /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
@@ -3220,10 +3142,7 @@ mod tests {
             "stamped before served: {}",
             sent[0]
         );
-        assert_eq!(
-            sent[1]["metadata"],
-            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
-        );
+        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
         assert!(
             sent[2]["metadata"].get("mandate_hash").is_none(),
             "stamped a hash the model never saw: {}",
@@ -3232,17 +3151,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stamp_sits_beside_expect_reply() {
+    async fn stamp_sits_beside_cc() {
         let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "x"))).await;
         let (client, _) = stdio_client(&base);
         client.get_mandate().await.unwrap();
         client
-            .send_message("r1", "?", vec!["apple".into()], Some(vec!["apple".into()]))
+            .send_message("r1", "?", vec!["apple".into()], vec!["pine".into()])
             .await
             .unwrap();
         assert_eq!(
             engine.sent.lock().await[0]["metadata"],
-            json!({ "expect_reply": ["apple"], "mandate_hash": "sha256:aaa" })
+            json!({ "cc": ["pine"], "mandate_hash": "sha256:aaa" })
         );
     }
 
@@ -3405,10 +3324,7 @@ mod tests {
 
         let sent = engine.sent.lock().await;
         assert!(sent[0]["metadata"].get("mandate_hash").is_none());
-        assert_eq!(
-            sent[1]["metadata"],
-            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
-        );
+        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
         assert!(sent[2]["metadata"].get("mandate_hash").is_none());
     }
 
@@ -3668,19 +3584,13 @@ mod tests {
         handle_http_request(&state, "tok", rpc("tools/call", send)).await;
 
         let sent = engine.sent.lock().await;
-        assert_eq!(
-            sent[0]["metadata"],
-            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
-        );
+        assert_eq!(sent[0]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
         assert!(
             sent[1]["metadata"].get("mandate_hash").is_none(),
             "a new conversation must not inherit the stamp: {}",
             sent[1]
         );
-        assert_eq!(
-            sent[2]["metadata"],
-            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
-        );
+        assert_eq!(sent[2]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
     }
 
     #[tokio::test]
