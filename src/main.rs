@@ -852,6 +852,10 @@ impl NubiClient {
                 copied.push(name);
             }
         }
+        // Copied wins over mentioned (the reply rules read it that way), so a
+        // name in both leaves mentions: it is seen, not asked. `here` stays,
+        // with cc carving people out of it.
+        to.retain(|n| !copied.contains(n));
         let cc = copied;
 
         let mut body = json!({
@@ -2493,7 +2497,7 @@ mod tests {
         let args = json!({
             "room_id": "r1",
             "text": "take this",
-            "mentions": ["@Apple", "me", "not an id", "apple"],
+            "mentions": ["@Apple", "me", "not an id", "apple", "pine"],
             "cc": ["pine", "@Me", "not an id", "@Pine", "a.b"]
         });
         let config = client.config.clone();
