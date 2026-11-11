@@ -2492,14 +2492,7 @@ mod tests {
     async fn the_tool_without_expect_reply_asks_nobody() {
         let (client, sent) = spawn_message_sink().await;
         let args = json!({"room_id": "r1", "text": "done", "mentions": ["manager"]});
-        let config = Arc::new(RwLock::new(Config {
-            base_url: String::new(),
-            token: "t".into(),
-            space_id: "s".into(),
-            agent_id: Some("me".into()),
-            token_file: None,
-            subscribe: None,
-        }));
+        let config = client.config.clone();
         let subs: Subscriptions = Arc::default();
         let (tx, _rx) = mpsc::unbounded_channel();
         handle_tool_call(&client, "nubi_send", &args, &config, &subs, &tx)
