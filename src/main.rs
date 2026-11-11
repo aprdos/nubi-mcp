@@ -844,7 +844,15 @@ impl NubiClient {
                 to.push(name);
             }
         }
-        let cc: Vec<String> = cc.into_iter().filter(not_me).collect();
+        // cc gets the same treatment: the engine resolves handles in it,
+        // and anything that can't be an id or repeats goes.
+        let mut copied: Vec<String> = Vec::new();
+        for name in cc.iter().filter_map(|m| mention_name(m)).filter(not_me) {
+            if !copied.contains(&name) {
+                copied.push(name);
+            }
+        }
+        let cc = copied;
 
         let mut body = json!({
             "message_id": message_id,
@@ -2486,7 +2494,7 @@ mod tests {
             "room_id": "r1",
             "text": "take this",
             "mentions": ["@Apple", "me", "not an id", "apple"],
-            "cc": ["pine", "@Me"]
+            "cc": ["pine", "@Me", "not an id", "@Pine", "a.b"]
         });
         let config = client.config.clone();
         let subs: Subscriptions = Arc::default();
