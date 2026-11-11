@@ -848,7 +848,8 @@ impl NubiClient {
         // and anything that can't be an id or repeats goes.
         let mut copied: Vec<String> = Vec::new();
         for name in cc.iter().filter_map(|m| mention_name(m)).filter(not_me) {
-            if !copied.contains(&name) {
+            // Copying everyone means nothing; `here` is only ever a To.
+            if name != "here" && !copied.contains(&name) {
                 copied.push(name);
             }
         }
@@ -2497,8 +2498,8 @@ mod tests {
         let args = json!({
             "room_id": "r1",
             "text": "take this",
-            "mentions": ["@Apple", "me", "not an id", "apple", "pine"],
-            "cc": ["pine", "@Me", "not an id", "@Pine", "a.b"]
+            "mentions": ["@Apple", "me", "not an id", "apple", "pine", "here"],
+            "cc": ["pine", "@Me", "not an id", "@Pine", "a.b", "here"]
         });
         let config = client.config.clone();
         let subs: Subscriptions = Arc::default();
@@ -2508,7 +2509,7 @@ mod tests {
             .unwrap();
         let body = &sent.lock().await[0];
         // Written the way the engine takes ids; yourself and non-ids dropped.
-        assert_eq!(body["mentions"], json!(["apple"]));
+        assert_eq!(body["mentions"], json!(["apple", "here"]));
         assert_eq!(body["metadata"], json!({ "cc": ["pine"] }));
         assert!(body["metadata"].get("expect_reply").is_none());
     }
