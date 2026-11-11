@@ -88,15 +88,19 @@ fn same_agent(a: &str, b: &str) -> bool {
 }
 
 /// A name from expect_reply as the engine accepts it in `mentions`: no `@`,
-/// lowercase, id characters only. The engine turns a handle (`pine`, or a
-/// skill set's `reviewer`) into agent ids itself; anything else (spaces,
-/// odd characters) would get the whole message refused, so it is left to
-/// `expect_reply`, where the engine resolves or ignores it.
+/// lowercase, and the engine's id shape (`^[a-z0-9][a-z0-9_-]{0,63}$`). The
+/// engine turns a handle (`pine`, or a skill set's `reviewer`) into agent
+/// ids itself; anything else (spaces, dots, only punctuation) would get the
+/// whole message refused, so it is left to `expect_reply`, where the engine
+/// resolves or ignores it.
 fn mention_name(name: &str) -> Option<String> {
     let n = name.trim().trim_start_matches('@').to_lowercase();
-    let ok = !n.is_empty()
-        && n.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    let mut chars = n.chars();
+    let ok = n.len() <= 64
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'));
     ok.then_some(n)
 }
 
@@ -2511,18 +2515,25 @@ mod tests {
                 "r1",
                 "review this",
                 vec!["apple".into()],
-                Some(vec!["@Apple".into(), "Reviewer".into(), "not an id".into()]),
+                Some(vec![
+                    "@Apple".into(),
+                    "Reviewer".into(),
+                    "not an id".into(),
+                    "---".into(),
+                    "a.b".into(),
+                ]),
             )
             .await
             .unwrap();
         let body = &sent.lock().await[0];
         // @Apple is apple, already there; Reviewer goes in bare and
-        // lowercase for the engine to resolve; a name with a space stays
-        // out of mentions, where it would get the message refused.
+        // lowercase for the engine to resolve; names the engine wouldn't take
+        // as an id (a space, only punctuation, a dot) stay out of mentions,
+        // where they would get the message refused.
         assert_eq!(body["mentions"], json!(["apple", "reviewer"]));
         assert_eq!(
             body["metadata"],
-            json!({ "expect_reply": ["@Apple", "Reviewer", "not an id"] })
+            json!({ "expect_reply": ["@Apple", "Reviewer", "not an id", "---", "a.b"] })
         );
     }
 
