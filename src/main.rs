@@ -2091,7 +2091,7 @@ fn compact_entry(e: &Value) -> Value {
             let mut rest = serde_json::Map::new();
             for (k, val) in payload["metadata"].as_object().into_iter().flatten() {
                 match k.as_str() {
-                    "cc" | "expect_reply" | "no_reply" => {
+                    "cc" | "no_reply" => {
                         m.insert(k.clone(), val.clone());
                     }
                     k if NOISE.contains(&k) => {}
@@ -2415,7 +2415,7 @@ mod tests {
                  "token_count": 65,
                  "payload": {"type": "message", "message_id": "b8e37b49-6a9f-4560-a3e3-293f36870793",
                     "mentions": ["grape"],
-                    "metadata": {"expect_reply": [], "usage": {"x": 1}, "mandate_hash": "h", "thread": "t1"},
+                    "metadata": {"cc": ["pine"], "usage": {"x": 1}, "mandate_hash": "h", "thread": "t1"},
                     "parts": [{"kind": "text", "text": "Reviewed "}, {"kind": "text", "text": "PR #101."}]}},
                 {"global_index": 286, "sender": "system", "timestamp_ms": 1_793_370_422_731u64,
                  "token_count": 16,
@@ -2432,7 +2432,7 @@ mod tests {
             json!({
                 "messages": [
                     {"index": 285, "from": "palm", "at": "2026-10-30T14:27:02Z",
-                     "text": "Reviewed PR #101.", "mentions": ["grape"], "expect_reply": [],
+                     "text": "Reviewed PR #101.", "mentions": ["grape"], "cc": ["pine"],
                      "metadata": {"thread": "t1"}},
                     {"index": 286, "from": "system", "at": "2026-10-30T14:27:02Z",
                      "event": {"kind": "member_joined", "agent_id": "melon"}},
@@ -2511,7 +2511,6 @@ mod tests {
         // Written the way the engine takes ids; yourself and non-ids dropped.
         assert_eq!(body["mentions"], json!(["apple", "here"]));
         assert_eq!(body["metadata"], json!({ "cc": ["pine"] }));
-        assert!(body["metadata"].get("expect_reply").is_none());
     }
 
     #[tokio::test]
