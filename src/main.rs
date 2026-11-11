@@ -87,6 +87,19 @@ fn same_agent(a: &str, b: &str) -> bool {
     norm(a) == norm(b)
 }
 
+/// A name from expect_reply as the engine accepts it in `mentions`: no `@`,
+/// lowercase, id characters only. The engine turns a handle (`pine`, or a
+/// skill set's `reviewer`) into agent ids itself; anything else (spaces,
+/// odd characters) would get the whole message refused, so it is left to
+/// `expect_reply`, where the engine resolves or ignores it.
+fn mention_name(name: &str) -> Option<String> {
+    let n = name.trim().trim_start_matches('@').to_lowercase();
+    let ok = !n.is_empty()
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    ok.then_some(n)
+}
+
 /// Keeps only skill rooms (and, given a status, only skills in that status).
 ///
 /// A room's kind is an object tagged by `type` (`{"type": "skill", "status":
@@ -826,8 +839,11 @@ impl NubiClient {
         // delivered the message, so they could never reply.
         if let Some(ref ids) = expect_reply {
             for id in ids {
-                if !mentions.iter().any(|m| m == id) {
-                    mentions.push(id.clone());
+                let Some(name) = mention_name(id) else {
+                    continue;
+                };
+                if !mentions.iter().any(|m| same_agent(m, &name)) {
+                    mentions.push(name);
                 }
             }
         }
@@ -1556,7 +1572,7 @@ fn tools_list_full() -> Value {
                         "expect_reply": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Who is on the hook to answer. Set it on every message that needs a response: [\"apple\"] puts it on apple even when you mentioned others, who then get it as context. Pass [] only for a note nobody should reply to, like an FYI or a status update. Omitting it leaves the message open to whoever feels like answering, which in practice is nobody — so omit it only when you genuinely do not mind."
+                            "description": "Who is on the hook to answer. Set it on every message that needs a response: [\"apple\"] puts it on apple even when you mentioned others, who then get it as context. Leave it out (or pass []) for a note nobody should reply to, like an FYI, a status update or an answer that closes the exchange: then nobody answers."
                         }
                     },
                     "required": ["room_id", "text"]
@@ -1726,10 +1742,12 @@ async fn handle_tool_call(
                         .collect()
                 })
                 .unwrap_or_default();
-            // Absent must stay absent: collapsing it to an empty list would
-            // tell every receiver to stay quiet.
+            // Left out means nobody is on the hook, the same as an agent's
+            // ordinary reply (nubi-agent posts those with []). Absent would let
+            // every mentioned agent answer, and two agents mentioning each
+            // other without it answer each other for ever.
             let expect_reply: Option<Vec<String>> = match args.get("expect_reply") {
-                None | Some(Value::Null) => None,
+                None | Some(Value::Null) => Some(Vec::new()),
                 Some(Value::Array(arr)) => Some(
                     arr.iter()
                         .filter_map(|v| v.as_str().map(String::from))
@@ -2471,6 +2489,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_tool_without_expect_reply_asks_nobody() {
+        let (client, sent) = spawn_message_sink().await;
+        let args = json!({"room_id": "r1", "text": "done", "mentions": ["manager"]});
+        let config = Arc::new(RwLock::new(Config {
+            base_url: String::new(),
+            token: "t".into(),
+            space_id: "s".into(),
+            agent_id: Some("me".into()),
+            token_file: None,
+            subscribe: None,
+        }));
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        handle_tool_call(&client, "nubi_send", &args, &config, &subs, &tx)
+            .await
+            .unwrap();
+        let body = &sent.lock().await[0];
+        assert_eq!(body["metadata"], json!({ "expect_reply": [] }));
+        assert_eq!(body["mentions"], json!(["manager"]));
+    }
+
+    #[tokio::test]
+    async fn expect_reply_names_reach_mentions_in_a_form_the_engine_takes() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message(
+                "r1",
+                "review this",
+                vec!["apple".into()],
+                Some(vec!["@Apple".into(), "Reviewer".into(), "not an id".into()]),
+            )
+            .await
+            .unwrap();
+        let body = &sent.lock().await[0];
+        // @Apple is apple, already there; Reviewer goes in bare and
+        // lowercase for the engine to resolve; a name with a space stays
+        // out of mentions, where it would get the message refused.
+        assert_eq!(body["mentions"], json!(["apple", "reviewer"]));
+        assert_eq!(
+            body["metadata"],
+            json!({ "expect_reply": ["@Apple", "Reviewer", "not an id"] })
+        );
+    }
+
+    #[tokio::test]
     async fn send_without_expect_reply_sends_no_metadata() {
         let (client, sent) = spawn_message_sink().await;
         client
@@ -3056,7 +3119,9 @@ mod tests {
             "no header without a mandate: {}",
             result
         );
-        assert!(engine.sent.lock().await[0].get("metadata").is_none());
+        assert!(engine.sent.lock().await[0]["metadata"]
+            .get("mandate_hash")
+            .is_none());
     }
 
     #[test]
@@ -3147,13 +3212,16 @@ mod tests {
 
         let sent = engine.sent.lock().await;
         assert!(
-            sent[0].get("metadata").is_none(),
+            sent[0]["metadata"].get("mandate_hash").is_none(),
             "stamped before served: {}",
             sent[0]
         );
-        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert_eq!(
+            sent[1]["metadata"],
+            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
+        );
         assert!(
-            sent[2].get("metadata").is_none(),
+            sent[2]["metadata"].get("mandate_hash").is_none(),
             "stamped a hash the model never saw: {}",
             sent[2]
         );
@@ -3332,9 +3400,12 @@ mod tests {
         handle_http_request(&state, "other", rpc("tools/call", send.clone())).await;
 
         let sent = engine.sent.lock().await;
-        assert!(sent[0].get("metadata").is_none());
-        assert_eq!(sent[1]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
-        assert!(sent[2].get("metadata").is_none());
+        assert!(sent[0]["metadata"].get("mandate_hash").is_none());
+        assert_eq!(
+            sent[1]["metadata"],
+            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
+        );
+        assert!(sent[2]["metadata"].get("mandate_hash").is_none());
     }
 
     #[tokio::test]
@@ -3593,13 +3664,19 @@ mod tests {
         handle_http_request(&state, "tok", rpc("tools/call", send)).await;
 
         let sent = engine.sent.lock().await;
-        assert_eq!(sent[0]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert_eq!(
+            sent[0]["metadata"],
+            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
+        );
         assert!(
-            sent[1].get("metadata").is_none(),
+            sent[1]["metadata"].get("mandate_hash").is_none(),
             "a new conversation must not inherit the stamp: {}",
             sent[1]
         );
-        assert_eq!(sent[2]["metadata"], json!({ "mandate_hash": "sha256:aaa" }));
+        assert_eq!(
+            sent[2]["metadata"],
+            json!({ "expect_reply": [], "mandate_hash": "sha256:aaa" })
+        );
     }
 
     #[tokio::test]
