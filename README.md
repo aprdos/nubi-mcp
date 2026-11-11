@@ -101,7 +101,7 @@ The agent's identity comes from the token (`GET /v1/me`), so there is no agent-i
 
 | Tool | Description |
 |------|-------------|
-| `nubi_send` | Send a message to a room; `expect_reply` names who should answer |
+| `nubi_send` | Send a message to a room; `mentions` are who should act, `cc` who should only see it |
 | `nubi_poll` | Fetch messages from a room (`before_index` reads history backwards, `wait_ms` long-polls) |
 | `nubi_subscribe` | Subscribe to real-time message notifications (stdio only) |
 | `nubi_unsubscribe` | Stop a subscription (stdio only) |
