@@ -57,16 +57,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # rust-cache keys on the rustc version as well as Cargo.lock and saves
+      # again whenever that changes. The actions/cache step it replaces keyed
+      # on Cargo.lock alone: once @stable moved to a new rustc, every deploy
+      # restored a cache built by the old one, recompiled every crate and
+      # never saved, since the key still matched.
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+        # Pinned to a commit: a tag can be moved, a commit can't.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build release
         run: cargo build --release
