@@ -1881,9 +1881,12 @@ async fn handle_tool_call(
             let kind = args.get("kind").and_then(|v| v.as_str());
             let steps = args.get("steps");
             let assignee = args.get("assignee").and_then(|v| v.as_str());
-            // Validate: steps required when kind is "steps"
+            // Validate: steps required when kind is "steps", and only valid for steps rooms
             if kind == Some("steps") && steps.is_none() {
                 return Err("steps object required when kind is 'steps'".to_string());
+            }
+            if kind != Some("steps") && steps.is_some() {
+                return Err("steps object is only valid when kind is 'steps'".to_string());
             }
             client.create_room(name, kind, steps, assignee).await
         }
