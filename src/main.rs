@@ -1879,7 +1879,7 @@ async fn handle_tool_call(
         "nubi_create_room" => {
             let name = args["name"].as_str().ok_or("name required")?;
             let kind = args.get("kind").and_then(|v| v.as_str());
-            let steps = args.get("steps");
+            let steps = args.get("steps").filter(|v| !v.is_null());
             let assignee = args.get("assignee").and_then(|v| v.as_str());
             // Validate: steps required when kind is "steps", and only valid for steps rooms
             if kind == Some("steps") && steps.is_none() {
