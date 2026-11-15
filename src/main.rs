@@ -1008,7 +1008,13 @@ impl NubiClient {
         );
         let body = match action {
             "approve" => json!({ "action": "approve" }),
-            "reject" => json!({ "action": { "reject": { "feedback": feedback.unwrap_or("") } } }),
+            "reject" => {
+                let fb = feedback.unwrap_or("");
+                if fb.is_empty() {
+                    return Err("feedback is required when rejecting a step".to_string());
+                }
+                json!({ "action": { "reject": { "feedback": fb } } })
+            }
             _ => return Err(format!("action must be 'approve' or 'reject', got '{}'", action)),
         };
         self.request(reqwest::Method::POST, &path, Some(body)).await
