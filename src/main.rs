@@ -105,35 +105,6 @@ fn mention_name(name: &str) -> Option<String> {
     ok.then_some(n)
 }
 
-/// Keeps only skill rooms (and, given a status, only skills in that status).
-///
-/// A room's kind is an object tagged by `type` (`{"type": "skill", "status":
-/// "published", ...}`), not a bare string, so comparing `kind` itself to
-/// `"skill"` never matches.
-fn filter_skill_rooms(rooms: Value, status: Option<&str>, query: Option<&str>) -> Value {
-    let Value::Array(rooms) = rooms else {
-        return rooms;
-    };
-    let query_lower = query.map(|q| q.to_lowercase());
-    Value::Array(
-        rooms
-            .into_iter()
-            .filter(|r| r["kind"]["type"].as_str() == Some("skill"))
-            .filter(|r| status.is_none_or(|s| r["kind"]["status"].as_str() == Some(s)))
-            .filter(|r| {
-                query_lower.as_ref().is_none_or(|q| {
-                    let name = r["name"].as_str().unwrap_or("").to_lowercase();
-                    let desc = r["kind"]["description"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_lowercase();
-                    name.contains(q) || desc.contains(q)
-                })
-            })
-            .collect(),
-    )
-}
-
 // --- Mandate ---
 
 /// How long a known mandate is trusted before a tool call re-checks it with
@@ -596,20 +567,38 @@ impl NubiClient {
         }
     }
 
-    async fn list_skill_sets(&self, status: Option<&str>) -> Result<Value, String> {
+    async fn list_skill_sets(
+        &self,
+        status: Option<&str>,
+        query: Option<&str>,
+        source_type: Option<&str>,
+    ) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/skill-sets", self.space_id().await);
+        let mut params = Vec::new();
         if let Some(s) = status {
-            path = format!("{}?status={}", path, urlencoding::encode(s));
+            params.push(format!("status={}", urlencoding::encode(s)));
+        }
+        if let Some(q) = query {
+            params.push(format!("query={}", urlencoding::encode(q)));
+        }
+        if let Some(st) = source_type {
+            params.push(format!("source_type={}", urlencoding::encode(st)));
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
         }
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn get_skill_set(&self, set_id: &str) -> Result<Value, String> {
-        let path = format!(
+    async fn get_skill_set(&self, set_id: &str, include_content: bool) -> Result<Value, String> {
+        let mut path = format!(
             "/v1/spaces/{}/skill-sets/{}",
             self.space_id().await,
             urlencoding::encode(set_id)
         );
+        if include_content {
+            path = format!("{}?include_content=true", path);
+        }
         self.request(reqwest::Method::GET, &path, None).await
     }
 
@@ -784,32 +773,6 @@ impl NubiClient {
 
     /// Skill rooms the caller belongs to, optionally narrowed by status.
     ///
-    /// The engine filters on `kind` and `status` itself, but an engine that
-    /// predates either filter ignores the query string and returns every room,
-    /// so the result is filtered again here on the room's `kind.type` and
-    /// `kind.status`.
-    async fn list_skills(
-        &self,
-        status: Option<&str>,
-        query: Option<&str>,
-    ) -> Result<Value, String> {
-        let mut path = format!("/v1/spaces/{}/rooms?kind=skill", self.space_id().await);
-        if let Some(s) = status {
-            path = format!("{}&status={}", path, urlencoding::encode(s));
-        }
-        let rooms = self.request(reqwest::Method::GET, &path, None).await?;
-        Ok(filter_skill_rooms(rooms, status, query))
-    }
-
-    async fn get_skill_prompt(&self, room_id: &str) -> Result<Value, String> {
-        let path = format!(
-            "/v1/spaces/{}/skills/{}/prompt",
-            self.space_id().await,
-            urlencoding::encode(room_id)
-        );
-        self.request(reqwest::Method::GET, &path, None).await
-    }
-
     async fn get_room(&self, room_id: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms/{}", self.space_id().await, room_id);
         self.request(reqwest::Method::GET, &path, None).await
@@ -1528,46 +1491,31 @@ fn tools_list_full() -> Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
-                "name": "nubi_list_skills",
-                "description": "List skills you have access to. Use query to search by keyword when looking for skills that might help with an unfamiliar workflow or task.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skills in this status" },
-                        "query": { "type": "string", "description": "Search skills by name or description (case-insensitive substring match)" }
-                    }
-                }
-            },
-            {
-                "name": "nubi_get_skill",
-                "description": "Get a skill's content/prompt. Returns the full skill definition ready to save to .claude/skills/",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": { "room_id": { "type": "string", "description": "The skill room id" } },
-                    "required": ["room_id"]
-                }
-            },
-            {
                 "name": "nubi_get_mandate",
                 "description": "Read your mandate: the skills you are bound to follow, in order, with their full content and a hash. Call it before your first message and whenever you are told the mandate changed; your messages only carry proof that you read the current mandate after you have called this.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "nubi_list_skill_sets",
-                "description": "List skill sets you are a member of or are bound to",
+                "description": "Search and list skill sets. Use query to find skill sets for unfamiliar workflows. Filter by source_type for system (platform-maintained) or user (team-created) sets.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skill sets in this status" }
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skill sets in this status" },
+                        "query": { "type": "string", "description": "Search by name or description (case-insensitive substring match)" },
+                        "source_type": { "type": "string", "enum": ["system", "user", "marketplace"], "description": "Filter by source type: system (platform best practices), user (team-created), marketplace (installed)" }
                     }
                 }
             },
             {
                 "name": "nubi_get_skill_set",
-                "description": "Get a skill set: its details and the skills it holds (names and statuses, not content)",
+                "description": "Get a skill set with its skills. Pass include_content=true to get full skill prompts inline — no second call needed.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "set_id": { "type": "string", "description": "The skill set id" } },
+                    "properties": {
+                        "set_id": { "type": "string", "description": "The skill set id" },
+                        "include_content": { "type": "boolean", "description": "Include full skill content/prompts in response. Default false." }
+                    },
                     "required": ["set_id"]
                 }
             },
@@ -1833,20 +1781,20 @@ async fn handle_tool_call(
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => client.list_rooms(None).await,
-        "nubi_list_skills" => {
+        "nubi_get_mandate" => client.get_mandate().await,
+        "nubi_list_skill_sets" => {
             client
-                .list_skills(args["status"].as_str(), args["query"].as_str())
+                .list_skill_sets(
+                    args["status"].as_str(),
+                    args["query"].as_str(),
+                    args["source_type"].as_str(),
+                )
                 .await
         }
-        "nubi_get_skill" => {
-            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            client.get_skill_prompt(room_id).await
-        }
-        "nubi_get_mandate" => client.get_mandate().await,
-        "nubi_list_skill_sets" => client.list_skill_sets(args["status"].as_str()).await,
         "nubi_get_skill_set" => {
             let set_id = args["set_id"].as_str().ok_or("set_id required")?;
-            client.get_skill_set(set_id).await
+            let include_content = args["include_content"].as_bool().unwrap_or(false);
+            client.get_skill_set(set_id, include_content).await
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_get_doc" => {
@@ -2987,53 +2935,6 @@ mod tests {
         (NubiClient::new(config), queries)
     }
 
-    #[tokio::test]
-    async fn list_skills_matches_on_kind_type() {
-        let (client, queries) = spawn_unfiltered_rooms().await;
-        let skills = client.list_skills(None, None).await.unwrap();
-        let ids: Vec<&str> = skills
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["id"].as_str().unwrap())
-            .collect();
-        // master sent `?kind=skill` and trusted the engine to filter; an
-        // engine that ignores the parameter returned every room. `kind` is
-        // a tagged object, so the local check compares `kind.type`.
-        assert_eq!(ids, vec!["s1", "s2"]);
-        assert_eq!(queries.lock().await[0], "kind=skill");
-    }
-
-    #[tokio::test]
-    async fn list_skills_filters_by_status() {
-        let (client, queries) = spawn_unfiltered_rooms().await;
-        let skills = client.list_skills(Some("published"), None).await.unwrap();
-        assert_eq!(
-            skills,
-            json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
-        );
-        assert_eq!(queries.lock().await[0], "kind=skill&status=published");
-    }
-
-    #[tokio::test]
-    async fn list_skills_filters_by_query() {
-        let (client, _) = spawn_unfiltered_rooms().await;
-        let skills = client.list_skills(None, Some("refund")).await.unwrap();
-        assert_eq!(
-            skills,
-            json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
-        );
-        // case-insensitive
-        let skills = client.list_skills(None, Some("TONE")).await.unwrap();
-        assert_eq!(
-            skills,
-            json!([{ "id": "s2", "name": "Tone", "kind": { "type": "skill", "status": "draft" } }])
-        );
-        // no match
-        let skills = client.list_skills(None, Some("xyz")).await.unwrap();
-        assert_eq!(skills, json!([]));
-    }
-
     // --- Mandate and skill sets ---
 
     /// A mock engine with skill sets: `/v1/me`, a mutable mandate (`None`
@@ -3251,8 +3152,6 @@ mod tests {
                 "nubi_get_mandate",
                 "nubi_list_skill_sets",
                 "nubi_get_skill_set",
-                "nubi_get_skill",
-                "nubi_list_skills",
                 "nubi_list_docs",
                 "nubi_get_doc",
                 "nubi_create_doc",
@@ -3296,9 +3195,9 @@ mod tests {
         );
 
         // Errors are not where the header belongs.
-        let err = call_result(&client, &config, "nubi_get_skill", json!({})).await;
+        let err = call_result(&client, &config, "nubi_get_skill_set", json!({})).await;
         assert_eq!(err["isError"], true);
-        assert_eq!(texts(&err), vec!["Error: room_id required"]);
+        assert_eq!(texts(&err), vec!["Error: set_id required"]);
 
         let (base, _engine) = spawn_engine(None).await;
         let (client, config) = stdio_client(&base);
