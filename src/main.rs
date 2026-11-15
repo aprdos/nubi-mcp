@@ -112,7 +112,7 @@ fn mention_name(name: &str) -> Option<String> {
 /// `"skill"` never matches.
 fn filter_skill_rooms(rooms: Value, status: Option<&str>, query: Option<&str>) -> Value {
     let Value::Array(rooms) = rooms else {
-        return rooms;
+        return Value::Array(vec![]);
     };
     let query_lower = query.map(|q| q.to_lowercase());
     Value::Array(
