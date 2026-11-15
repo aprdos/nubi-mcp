@@ -110,15 +110,23 @@ fn mention_name(name: &str) -> Option<String> {
 /// A room's kind is an object tagged by `type` (`{"type": "skill", "status":
 /// "published", ...}`), not a bare string, so comparing `kind` itself to
 /// `"skill"` never matches.
-fn filter_skill_rooms(rooms: Value, status: Option<&str>) -> Value {
+fn filter_skill_rooms(rooms: Value, status: Option<&str>, query: Option<&str>) -> Value {
     let Value::Array(rooms) = rooms else {
         return rooms;
     };
+    let query_lower = query.map(|q| q.to_lowercase());
     Value::Array(
         rooms
             .into_iter()
             .filter(|r| r["kind"]["type"].as_str() == Some("skill"))
             .filter(|r| status.is_none_or(|s| r["kind"]["status"].as_str() == Some(s)))
+            .filter(|r| {
+                query_lower.as_ref().is_none_or(|q| {
+                    let name = r["name"].as_str().unwrap_or("").to_lowercase();
+                    let desc = r["kind"]["description"].as_str().unwrap_or("").to_lowercase();
+                    name.contains(q) || desc.contains(q)
+                })
+            })
             .collect(),
     )
 }
@@ -777,13 +785,13 @@ impl NubiClient {
     /// predates either filter ignores the query string and returns every room,
     /// so the result is filtered again here on the room's `kind.type` and
     /// `kind.status`.
-    async fn list_skills(&self, status: Option<&str>) -> Result<Value, String> {
+    async fn list_skills(&self, status: Option<&str>, query: Option<&str>) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/rooms?kind=skill", self.space_id().await);
         if let Some(s) = status {
             path = format!("{}&status={}", path, urlencoding::encode(s));
         }
         let rooms = self.request(reqwest::Method::GET, &path, None).await?;
-        Ok(filter_skill_rooms(rooms, status))
+        Ok(filter_skill_rooms(rooms, status, query))
     }
 
     async fn get_skill_prompt(&self, room_id: &str) -> Result<Value, String> {
@@ -1514,11 +1522,12 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_list_skills",
-                "description": "List skills you have access to",
+                "description": "List skills you have access to. Use query to search by keyword when looking for skills that might help with an unfamiliar workflow or task.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skills in this status" }
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skills in this status" },
+                        "query": { "type": "string", "description": "Search skills by name or description (case-insensitive substring match)" }
                     }
                 }
             },
@@ -1817,7 +1826,11 @@ async fn handle_tool_call(
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => client.list_rooms(None).await,
-        "nubi_list_skills" => client.list_skills(args["status"].as_str()).await,
+        "nubi_list_skills" => {
+            client
+                .list_skills(args["status"].as_str(), args["query"].as_str())
+                .await
+        }
         "nubi_get_skill" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_skill_prompt(room_id).await
@@ -2970,7 +2983,7 @@ mod tests {
     #[tokio::test]
     async fn list_skills_matches_on_kind_type() {
         let (client, queries) = spawn_unfiltered_rooms().await;
-        let skills = client.list_skills(None).await.unwrap();
+        let skills = client.list_skills(None, None).await.unwrap();
         let ids: Vec<&str> = skills
             .as_array()
             .unwrap()
@@ -2987,12 +3000,31 @@ mod tests {
     #[tokio::test]
     async fn list_skills_filters_by_status() {
         let (client, queries) = spawn_unfiltered_rooms().await;
-        let skills = client.list_skills(Some("published")).await.unwrap();
+        let skills = client.list_skills(Some("published"), None).await.unwrap();
         assert_eq!(
             skills,
             json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
         );
         assert_eq!(queries.lock().await[0], "kind=skill&status=published");
+    }
+
+    #[tokio::test]
+    async fn list_skills_filters_by_query() {
+        let (client, _) = spawn_unfiltered_rooms().await;
+        let skills = client.list_skills(None, Some("refund")).await.unwrap();
+        assert_eq!(
+            skills,
+            json!([{ "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } }])
+        );
+        // case-insensitive
+        let skills = client.list_skills(None, Some("TONE")).await.unwrap();
+        assert_eq!(
+            skills,
+            json!([{ "id": "s2", "name": "Tone", "kind": { "type": "skill", "status": "draft" } }])
+        );
+        // no match
+        let skills = client.list_skills(None, Some("xyz")).await.unwrap();
+        assert_eq!(skills, json!([]));
     }
 
     // --- Mandate and skill sets ---
