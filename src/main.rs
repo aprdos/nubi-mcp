@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
@@ -800,8 +802,18 @@ impl NubiClient {
 
     async fn create_room(&self, name: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        self.request(reqwest::Method::POST, &path, Some(json!({ "name": name })))
-            .await
+        let body = json!({ "name": name });
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn create_steps(&self, name: &str, steps: &Value) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
+        let body = json!({
+            "name": name,
+            "room_type": "steps",
+            "steps": { "steps": steps }
+        });
+        self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
     async fn get_or_create_dm(&self, with_agent: &str) -> Result<Value, String> {
@@ -1605,8 +1617,44 @@ fn tools_list_full() -> Value {
                 "description": "Create a new group room",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "name": { "type": "string" } },
+                    "properties": {
+                        "name": { "type": "string" }
+                    },
                     "required": ["name"]
+                }
+            },
+            {
+                "name": "nubi_create_steps",
+                "description": "Create a Steps workflow room with a DAG of steps",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Room name" },
+                        "steps": {
+                            "type": "array",
+                            "description": "Array of step definitions forming a DAG",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Unique step ID" },
+                                    "assignees": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Agent IDs assigned to this step"
+                                    },
+                                    "description": { "type": "string" },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Step IDs this step depends on"
+                                    },
+                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" }
+                                },
+                                "required": ["id", "assignees", "description"]
+                            }
+                        }
+                    },
+                    "required": ["name", "steps"]
                 }
             },
             {
@@ -1815,6 +1863,13 @@ async fn handle_tool_call(
         "nubi_create_room" => {
             let name = args["name"].as_str().ok_or("name required")?;
             client.create_room(name).await
+        }
+        "nubi_create_steps" => {
+            let name = args["name"].as_str().ok_or("name required")?;
+            let steps = args["steps"].as_array().ok_or("steps must be an array")?;
+            client
+                .create_steps(name, &serde_json::Value::Array(steps.clone()))
+                .await
         }
         "nubi_dm" => {
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
