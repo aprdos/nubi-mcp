@@ -800,24 +800,19 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn create_room(
-        &self,
-        name: &str,
-        kind: Option<&str>,
-        steps: Option<&Value>,
-        assignee: Option<&str>,
-    ) -> Result<Value, String> {
+    async fn create_room(&self, name: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        let mut body = json!({ "name": name });
-        if let Some(k) = kind {
-            body["room_type"] = json!(k);
-        }
-        if let Some(s) = steps {
-            body["steps"] = s.clone();
-        }
-        if let Some(a) = assignee {
-            body["assignee"] = json!(a);
-        }
+        let body = json!({ "name": name });
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn create_steps(&self, name: &str, steps: &Value) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
+        let body = json!({
+            "name": name,
+            "room_type": "steps",
+            "steps": { "steps": steps }
+        });
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
@@ -1619,58 +1614,47 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_room",
-                "description": "Create a new room. Defaults to a group room; pass kind='steps' with a steps object to create a Steps workflow room.",
+                "description": "Create a new group room",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string" },
-                        "kind": {
-                            "type": "string",
-                            "description": "Room kind: 'group' (default), 'task', 'steps', or 'doc'",
-                            "enum": ["group", "task", "steps", "doc"]
-                        },
-                        "steps": {
-                            "type": "object",
-                            "description": "Steps workflow config (required when kind='steps')",
-                            "properties": {
-                                "steps": {
-                                    "type": "array",
-                                    "description": "Array of step definitions forming a DAG",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "id": { "type": "string", "description": "Unique step ID" },
-                                            "assignees": {
-                                                "type": "array",
-                                                "items": { "type": "string" },
-                                                "description": "Agent IDs assigned to this step"
-                                            },
-                                            "description": { "type": "string" },
-                                            "depends_on": {
-                                                "type": "array",
-                                                "items": { "type": "string" },
-                                                "description": "Step IDs this step depends on"
-                                            },
-                                            "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" }
-                                        },
-                                        "required": ["id", "assignees", "description"]
-                                    }
-                                },
-                                "default_verifier": {
-                                    "type": "object",
-                                    "description": "Default verifier for steps using VerifierConfig::Default"
-                                },
-                                "edit_policy": {
-                                    "type": "string",
-                                    "enum": ["owner_only", "assignee_can_edit", "open"]
-                                },
-                                "parent_room": { "type": "string", "description": "Parent room ID this workflow was created from" }
-                            },
-                            "required": ["steps"]
-                        },
-                        "assignee": { "type": "string", "description": "Assignee (for task rooms)" }
+                        "name": { "type": "string" }
                     },
                     "required": ["name"]
+                }
+            },
+            {
+                "name": "nubi_create_steps",
+                "description": "Create a Steps workflow room with a DAG of steps",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Room name" },
+                        "steps": {
+                            "type": "array",
+                            "description": "Array of step definitions forming a DAG",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Unique step ID" },
+                                    "assignees": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Agent IDs assigned to this step"
+                                    },
+                                    "description": { "type": "string" },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Step IDs this step depends on"
+                                    },
+                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" }
+                                },
+                                "required": ["id", "assignees", "description"]
+                            }
+                        }
+                    },
+                    "required": ["name", "steps"]
                 }
             },
             {
@@ -1878,17 +1862,12 @@ async fn handle_tool_call(
         }
         "nubi_create_room" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let kind = args.get("kind").and_then(|v| v.as_str());
-            let steps = args.get("steps").filter(|v| !v.is_null());
-            let assignee = args.get("assignee").and_then(|v| v.as_str());
-            // Validate: steps required when kind is "steps", and only valid for steps rooms
-            if kind == Some("steps") && steps.is_none() {
-                return Err("steps object required when kind is 'steps'".to_string());
-            }
-            if kind != Some("steps") && steps.is_some() {
-                return Err("steps object is only valid when kind is 'steps'".to_string());
-            }
-            client.create_room(name, kind, steps, assignee).await
+            client.create_room(name).await
+        }
+        "nubi_create_steps" => {
+            let name = args["name"].as_str().ok_or("name required")?;
+            let steps = args.get("steps").ok_or("steps required")?;
+            client.create_steps(name, steps).await
         }
         "nubi_dm" => {
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
