@@ -1015,7 +1015,12 @@ impl NubiClient {
                 }
                 json!({ "action": { "reject": { "feedback": fb } } })
             }
-            _ => return Err(format!("action must be 'approve' or 'reject', got '{}'", action)),
+            _ => {
+                return Err(format!(
+                    "action must be 'approve' or 'reject', got '{}'",
+                    action
+                ))
+            }
         };
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
