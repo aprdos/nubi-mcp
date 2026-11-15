@@ -1866,8 +1866,10 @@ async fn handle_tool_call(
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let steps = args.get("steps").ok_or("steps required")?;
-            client.create_steps(name, steps).await
+            let steps = args["steps"].as_array().ok_or("steps must be an array")?;
+            client
+                .create_steps(name, &serde_json::Value::Array(steps.clone()))
+                .await
         }
         "nubi_dm" => {
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
