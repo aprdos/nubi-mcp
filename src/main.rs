@@ -123,7 +123,10 @@ fn filter_skill_rooms(rooms: Value, status: Option<&str>, query: Option<&str>) -
             .filter(|r| {
                 query_lower.as_ref().is_none_or(|q| {
                     let name = r["name"].as_str().unwrap_or("").to_lowercase();
-                    let desc = r["kind"]["description"].as_str().unwrap_or("").to_lowercase();
+                    let desc = r["kind"]["description"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_lowercase();
                     name.contains(q) || desc.contains(q)
                 })
             })
@@ -785,7 +788,11 @@ impl NubiClient {
     /// predates either filter ignores the query string and returns every room,
     /// so the result is filtered again here on the room's `kind.type` and
     /// `kind.status`.
-    async fn list_skills(&self, status: Option<&str>, query: Option<&str>) -> Result<Value, String> {
+    async fn list_skills(
+        &self,
+        status: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/rooms?kind=skill", self.space_id().await);
         if let Some(s) = status {
             path = format!("{}&status={}", path, urlencoding::encode(s));
