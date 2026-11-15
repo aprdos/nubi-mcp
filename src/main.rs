@@ -993,6 +993,57 @@ impl NubiClient {
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
+    async fn verify_step(
+        &self,
+        room_id: &str,
+        step_id: &str,
+        action: &str,
+        feedback: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/steps/{}/verify",
+            self.space_id().await,
+            urlencoding::encode(room_id),
+            urlencoding::encode(step_id)
+        );
+        let body = match action {
+            "approve" => json!({ "action": "approve" }),
+            "reject" => {
+                let fb = feedback.unwrap_or("");
+                if fb.is_empty() {
+                    return Err("feedback is required when rejecting a step".to_string());
+                }
+                json!({ "action": { "reject": { "feedback": fb } } })
+            }
+            _ => {
+                return Err(format!(
+                    "action must be 'approve' or 'reject', got '{}'",
+                    action
+                ))
+            }
+        };
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn skip_step(
+        &self,
+        room_id: &str,
+        step_id: &str,
+        reason: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/steps/{}/skip",
+            self.space_id().await,
+            urlencoding::encode(room_id),
+            urlencoding::encode(step_id)
+        );
+        let body = match reason {
+            Some(r) => json!({ "reason": r }),
+            None => json!({}),
+        };
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
     async fn reload_token(&self) -> Result<(), String> {
         let mut config = self.config.write().await;
         config.reload_token()
@@ -1673,6 +1724,33 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_verify_step",
+                "description": "Approve or reject a step that is awaiting verification in a Steps room. Only the configured verifier (room owner by default, or a specific agent) can call this.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Steps room id" },
+                        "step_id": { "type": "string", "description": "The step id to verify" },
+                        "action": { "type": "string", "enum": ["approve", "reject"], "description": "Whether to approve or reject the step" },
+                        "feedback": { "type": "string", "description": "Required when rejecting: feedback for the assignee explaining what needs revision" }
+                    },
+                    "required": ["room_id", "step_id", "action"]
+                }
+            },
+            {
+                "name": "nubi_skip_step",
+                "description": "Skip a step in a Steps room. Only the room owner can skip steps. Skipping unblocks dependent steps.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Steps room id" },
+                        "step_id": { "type": "string", "description": "The step id to skip" },
+                        "reason": { "type": "string", "description": "Optional reason for skipping" }
+                    },
+                    "required": ["room_id", "step_id"]
+                }
+            },
+            {
                 "name": "nubi_reload",
                 "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -1812,6 +1890,22 @@ async fn handle_tool_call(
                 .ok_or("message_index required")?;
             let name = args["name"].as_str();
             client.create_thread(room_id, message_index, name).await
+        }
+        "nubi_verify_step" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let step_id = args["step_id"].as_str().ok_or("step_id required")?;
+            let action = args["action"].as_str().ok_or("action required")?;
+            let feedback = args["feedback"].as_str();
+            if action == "reject" && feedback.is_none() {
+                return Err("feedback required when rejecting".to_string());
+            }
+            client.verify_step(room_id, step_id, action, feedback).await
+        }
+        "nubi_skip_step" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let step_id = args["step_id"].as_str().ok_or("step_id required")?;
+            let reason = args["reason"].as_str();
+            client.skip_step(room_id, step_id, reason).await
         }
         "nubi_reload" => {
             client.reload_token().await?;
