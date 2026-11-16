@@ -602,6 +602,43 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
+    /// Create a skill set. `source_type` defaults to "user"; "system" and
+    /// "marketplace" require the admin key.
+    async fn create_skill_set(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        status: Option<&str>,
+        source_type: Option<&str>,
+        skills: Option<&[Value]>,
+    ) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/skill-sets", self.space_id().await);
+        let mut body = json!({ "name": name });
+        if let Some(d) = description.filter(|d| !d.trim().is_empty()) {
+            body["description"] = json!(d);
+        }
+        if let Some(s) = status {
+            body["status"] = json!(s);
+        }
+        if let Some(st) = source_type {
+            body["source_type"] = json!(st);
+        }
+        if let Some(sk) = skills {
+            body["skills"] = json!(sk);
+        }
+        let meta = self
+            .request(reqwest::Method::POST, &path, Some(body))
+            .await?;
+        let kind = &meta["kind"];
+        Ok(json!({
+            "set_id": meta["id"],
+            "name": meta["name"],
+            "status": kind["status"],
+            "source_type": kind["source_type"],
+            "revision": kind["revision"],
+        }))
+    }
+
     /// Doc rooms the caller belongs to, optionally narrowed by status, in a
     /// compact shape: what an agent needs to pick one.
     async fn list_docs(&self, status: Option<&str>) -> Result<Value, String> {
@@ -1520,6 +1557,33 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_create_skill_set",
+                "description": "Create a skill set. Source type defaults to 'user'; 'system' and 'marketplace' require the admin key.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The skill set's name" },
+                        "description": { "type": "string", "description": "A short description (optional)" },
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Publication status (default: draft)" },
+                        "source_type": { "type": "string", "enum": ["user", "system", "marketplace"], "description": "Where the set came from (default: user)" },
+                        "skills": {
+                            "type": "array",
+                            "description": "Skills in resolution order",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "room_id": { "type": "string", "description": "The skill room id" },
+                                    "pin": { "type": "integer", "description": "Pinned version (optional)" },
+                                    "required": { "type": "boolean", "description": "Is the skill required (default: true)" }
+                                },
+                                "required": ["room_id"]
+                            }
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
                 "name": "nubi_list_docs",
                 "description": "List docs you can read: specs, proposals and notes written and reviewed by people and agents. Each has a review status (draft, in_review, approved, archived).",
                 "inputSchema": {
@@ -1795,6 +1859,19 @@ async fn handle_tool_call(
             let set_id = args["set_id"].as_str().ok_or("set_id required")?;
             let include_content = args["include_content"].as_bool().unwrap_or(false);
             client.get_skill_set(set_id, include_content).await
+        }
+        "nubi_create_skill_set" => {
+            let name = args["name"].as_str().ok_or("name required")?;
+            let skills = args["skills"].as_array().map(|a| a.as_slice());
+            client
+                .create_skill_set(
+                    name,
+                    args["description"].as_str(),
+                    args["status"].as_str(),
+                    args["source_type"].as_str(),
+                    skills,
+                )
+                .await
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_get_doc" => {
@@ -2903,6 +2980,7 @@ mod tests {
 
     /// An engine that ignores `?kind=` and `?status=` and returns every room,
     /// recording the query string it was asked for.
+    #[allow(dead_code)]
     async fn spawn_unfiltered_rooms() -> (NubiClient, Arc<Mutex<Vec<String>>>) {
         let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let app = axum::Router::new()
@@ -3029,6 +3107,16 @@ mod tests {
                         e.paths.lock().await.push(uri.to_string());
                         axum::Json(json!([{ "id": "tier1", "name": "Tier 1 support" }]))
                     },
+                )
+                .post(
+                    |State(e): State<MockEngine>, uri: axum::http::Uri| async move {
+                        e.paths.lock().await.push(uri.to_string());
+                        axum::Json(json!({
+                            "id": "new-set-abc",
+                            "name": "New Set",
+                            "kind": { "status": "draft", "source_type": "system", "revision": 0 }
+                        }))
+                    },
                 ),
             )
             .route(
@@ -3152,6 +3240,7 @@ mod tests {
                 "nubi_get_mandate",
                 "nubi_list_skill_sets",
                 "nubi_get_skill_set",
+                "nubi_create_skill_set",
                 "nubi_list_docs",
                 "nubi_get_doc",
                 "nubi_create_doc",
@@ -3434,12 +3523,20 @@ mod tests {
         )
         .await;
         assert!(set.contains("\"id\":\"tier1\""));
+        call(
+            &client,
+            &config,
+            "nubi_create_skill_set",
+            json!({ "name": "New Set", "source_type": "system" }),
+        )
+        .await;
         assert_eq!(
             *engine.paths.lock().await,
             vec![
                 "/v1/spaces/s/skill-sets",
                 "/v1/spaces/s/skill-sets?status=published",
                 "/v1/spaces/s/skill-sets/tier%201",
+                "/v1/spaces/s/skill-sets",
             ]
         );
     }
