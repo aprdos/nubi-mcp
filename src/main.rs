@@ -2980,6 +2980,7 @@ mod tests {
 
     /// An engine that ignores `?kind=` and `?status=` and returns every room,
     /// recording the query string it was asked for.
+    #[allow(dead_code)]
     async fn spawn_unfiltered_rooms() -> (NubiClient, Arc<Mutex<Vec<String>>>) {
         let queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let app = axum::Router::new()
