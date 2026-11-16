@@ -85,6 +85,29 @@ jobs:
             -e "ssh -i ~/.ssh/deploy_key" \
             target/release/nubi-mcp admin@${{ secrets.DEPLOY_HOST }}:~/nubi-mcp.new
 
+      # Configuration from AWS SSM Parameter Store (aprdos/nubi
+      # infra/secrets/README.md): /nubi/<env>/mcp/<NAME> lands in
+      # /run/nubi-mcp/secrets.env before every start, through a systemd
+      # drop-in. nubi-secrets itself is installed by the engine's deploy; on a
+      # host without it the service keeps the unit's own Environment= lines.
+      - name: Point the service at SSM
+        env:
+          TARGET_ENV: ${{ inputs.environment || 'staging' }}
+        run: |
+          case "$TARGET_ENV" in staging|production) ;; *) echo "unknown environment"; exit 1 ;; esac
+          ssh -i ~/.ssh/deploy_key admin@${{ secrets.DEPLOY_HOST }} "TARGET_ENV=\"$TARGET_ENV\" bash -s" << 'EOF'
+            set -e
+            if [ ! -x /usr/local/bin/nubi-secrets ]; then
+              echo "==> nubi-secrets not installed on this host; skipping SSM drop-in"
+              exit 0
+            fi
+            sudo mkdir -p /etc/systemd/system/nubi-mcp.service.d
+            /usr/local/bin/nubi-secrets "$TARGET_ENV" mcp --drop-in nubi-mcp \
+              | sudo tee /etc/systemd/system/nubi-mcp.service.d/zz-secrets.conf > /dev/null
+            sudo systemctl daemon-reload
+            echo "==> nubi-mcp reads /nubi/$TARGET_ENV/mcp/"
+          EOF
+
       - name: Swap and restart
         run: |
           ssh -i ~/.ssh/deploy_key admin@${{ secrets.DEPLOY_HOST }} << 'EOF'
