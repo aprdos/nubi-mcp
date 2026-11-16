@@ -639,6 +639,46 @@ impl NubiClient {
         }))
     }
 
+    /// Attach a skill set to an agent (self-bind).
+    async fn attach_skill_set(&self, set_id: &str) -> Result<Value, String> {
+        let agent_id = self
+            .self_id()
+            .await
+            .ok_or_else(|| "could not determine agent id".to_string())?;
+        let path = format!(
+            "/v1/spaces/{}/skill-sets/{}/agents/{}",
+            self.space_id().await,
+            urlencoding::encode(set_id),
+            urlencoding::encode(&agent_id)
+        );
+        self.request(reqwest::Method::PUT, &path, None).await?;
+        Ok(json!({
+            "attached": true,
+            "set_id": set_id,
+            "agent_id": agent_id,
+        }))
+    }
+
+    /// Detach a skill set from an agent (self-unbind).
+    async fn detach_skill_set(&self, set_id: &str) -> Result<Value, String> {
+        let agent_id = self
+            .self_id()
+            .await
+            .ok_or_else(|| "could not determine agent id".to_string())?;
+        let path = format!(
+            "/v1/spaces/{}/skill-sets/{}/agents/{}",
+            self.space_id().await,
+            urlencoding::encode(set_id),
+            urlencoding::encode(&agent_id)
+        );
+        self.request(reqwest::Method::DELETE, &path, None).await?;
+        Ok(json!({
+            "detached": true,
+            "set_id": set_id,
+            "agent_id": agent_id,
+        }))
+    }
+
     /// Doc rooms the caller belongs to, optionally narrowed by status, in a
     /// compact shape: what an agent needs to pick one.
     async fn list_docs(&self, status: Option<&str>) -> Result<Value, String> {
@@ -1584,6 +1624,28 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_attach_skill_set",
+                "description": "Attach a skill set to yourself. After attaching, call nubi_get_mandate to refresh your mandate with the new skills.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "set_id": { "type": "string", "description": "The skill set id to attach" }
+                    },
+                    "required": ["set_id"]
+                }
+            },
+            {
+                "name": "nubi_detach_skill_set",
+                "description": "Detach a skill set from yourself. After detaching, call nubi_get_mandate to refresh your mandate.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "set_id": { "type": "string", "description": "The skill set id to detach" }
+                    },
+                    "required": ["set_id"]
+                }
+            },
+            {
                 "name": "nubi_list_docs",
                 "description": "List docs you can read: specs, proposals and notes written and reviewed by people and agents. Each has a review status (draft, in_review, approved, archived).",
                 "inputSchema": {
@@ -1872,6 +1934,14 @@ async fn handle_tool_call(
                     skills,
                 )
                 .await
+        }
+        "nubi_attach_skill_set" => {
+            let set_id = args["set_id"].as_str().ok_or("set_id required")?;
+            client.attach_skill_set(set_id).await
+        }
+        "nubi_detach_skill_set" => {
+            let set_id = args["set_id"].as_str().ok_or("set_id required")?;
+            client.detach_skill_set(set_id).await
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_get_doc" => {
@@ -3241,6 +3311,8 @@ mod tests {
                 "nubi_list_skill_sets",
                 "nubi_get_skill_set",
                 "nubi_create_skill_set",
+                "nubi_attach_skill_set",
+                "nubi_detach_skill_set",
                 "nubi_list_docs",
                 "nubi_get_doc",
                 "nubi_create_doc",
