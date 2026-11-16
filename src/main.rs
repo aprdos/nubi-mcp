@@ -32,6 +32,8 @@ struct Args {
 #[derive(Clone)]
 struct Config {
     base_url: String,
+    /// Frontend app URL for constructing room links (e.g. https://app.nubi.chat)
+    app_url: Option<String>,
     token: String,
     space_id: String,
     /// Who this token belongs to, as the engine reports it. Resolved on first
@@ -57,6 +59,7 @@ impl Config {
 
         Ok(Self {
             base_url: std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+            app_url: std::env::var("NUBI_APP_URL").ok(),
             token,
             space_id: std::env::var("NUBI_SPACE").map_err(|_| "NUBI_SPACE required")?,
             agent_id: None,
@@ -716,13 +719,18 @@ impl NubiClient {
             .request(reqwest::Method::POST, &path, Some(body))
             .await?;
         let kind = &meta["kind"];
-        Ok(json!({
-            "room_id": meta["id"],
+        let room_id = meta["id"].as_str().unwrap_or_default();
+        let mut result = json!({
+            "room_id": room_id,
             "name": meta["name"],
             "status": kind["status"],
             "base_version": kind["current_version"],
             "version_count": kind["version_count"],
-        }))
+        });
+        if let Some(url) = self.room_url("doc", room_id).await {
+            result["url"] = json!(url);
+        }
+        Ok(result)
     }
 
     /// Save a new version. On a conflict (someone saved since `base_version`)
@@ -837,6 +845,17 @@ impl NubiClient {
         Some(id)
     }
 
+    /// Construct a frontend URL for a room, if app_url is configured.
+    async fn room_url(&self, room_type: &str, room_id: &str) -> Option<String> {
+        let app_url = self.config.read().await.app_url.clone()?;
+        let path = match room_type {
+            "doc" => "docs",
+            "steps" => "steps",
+            _ => return None,
+        };
+        Some(format!("{}/dashboard/{}/{}", app_url.trim_end_matches('/'), path, room_id))
+    }
+
     async fn list_rooms(&self, kind: Option<&str>) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         if let Some(k) = kind {
@@ -865,7 +884,17 @@ impl NubiClient {
             "room_type": "steps",
             "steps": { "steps": steps }
         });
-        self.request(reqwest::Method::POST, &path, Some(body)).await
+        let meta = self.request(reqwest::Method::POST, &path, Some(body)).await?;
+        let room_id = meta["id"].as_str().unwrap_or_default();
+        let mut result = json!({
+            "room_id": room_id,
+            "name": meta["name"],
+            "steps": meta["kind"]["steps"],
+        });
+        if let Some(url) = self.room_url("steps", room_id).await {
+            result["url"] = json!(url);
+        }
+        Ok(result)
     }
 
     async fn get_or_create_dm(&self, with_agent: &str) -> Result<Value, String> {
@@ -1054,7 +1083,14 @@ impl NubiClient {
             Some(n) => json!({ "name": n }),
             None => json!({}),
         };
-        self.request(reqwest::Method::POST, &path, Some(body)).await
+        let meta = self.request(reqwest::Method::POST, &path, Some(body)).await?;
+        let thread_room_id = meta["id"].as_str().unwrap_or_default();
+        Ok(json!({
+            "room_id": thread_room_id,
+            "name": meta["name"],
+            "parent_room_id": room_id,
+            "embed": format!("[thread:{}]", thread_room_id),
+        }))
     }
 
     async fn verify_step(
@@ -2198,6 +2234,7 @@ async fn handle_request(
 #[derive(Clone)]
 struct HttpState {
     base_url: String,
+    app_url: Option<String>,
     http: reqwest::Client,
     /// token -> who it belongs to, filled from GET /v1/me on first use.
     /// Only successfully authenticated tokens are cached, so size is
@@ -2220,6 +2257,7 @@ impl Me {
     fn client(&self, state: &HttpState, token: &str) -> (NubiClient, Arc<RwLock<Config>>) {
         let config = Arc::new(RwLock::new(Config {
             base_url: state.base_url.clone(),
+            app_url: state.app_url.clone(),
             token: token.to_string(),
             space_id: self.space_id.clone(),
             agent_id: Some(self.agent_id.clone()),
@@ -2541,8 +2579,10 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
 
 async fn run_http(addr: SocketAddr) {
     let base_url = std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let app_url = std::env::var("NUBI_APP_URL").ok();
     let state = HttpState {
         base_url: base_url.clone(),
+        app_url,
         http: http_client(),
         me_cache: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -2748,6 +2788,7 @@ mod tests {
 
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("me".into()),
@@ -2838,6 +2879,7 @@ mod tests {
         let (base_url, seen) = spawn_flaky_sse().await;
         let config = Arc::new(RwLock::new(Config {
             base_url,
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: None,
@@ -2881,6 +2923,7 @@ mod tests {
 
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "bad".into(),
             space_id: "s".into(),
             agent_id: None,
@@ -2924,6 +2967,7 @@ mod tests {
 
         let config = RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: None,
@@ -2995,6 +3039,7 @@ mod tests {
 
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "test-space".into(),
             agent_id: Some("me".into()),
@@ -3075,6 +3120,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("me".into()),
@@ -3210,6 +3256,7 @@ mod tests {
     fn stdio_client(base_url: &str) -> (NubiClient, Arc<RwLock<Config>>) {
         let config = Arc::new(RwLock::new(Config {
             base_url: base_url.to_string(),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("bot".into()),
@@ -3440,6 +3487,7 @@ mod tests {
 
         let config = RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("bot".into()),
@@ -3533,6 +3581,7 @@ mod tests {
         let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "Be kind."))).await;
         let state = HttpState {
             base_url: base,
+            app_url: None,
             http: reqwest::Client::new(),
             me_cache: Arc::default(),
         };
@@ -3754,6 +3803,7 @@ mod tests {
 
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: None,
             token: "t".into(),
             space_id: "s".into(),
             agent_id: None,
@@ -3816,6 +3866,7 @@ mod tests {
         let (base, engine) = spawn_engine(Some(mandate_body("sha256:aaa", "Be kind."))).await;
         let state = HttpState {
             base_url: base,
+            app_url: None,
             http: reqwest::Client::new(),
             me_cache: Arc::default(),
         };
@@ -3856,6 +3907,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let state = HttpState {
             base_url: format!("http://{}", addr),
+            app_url: None,
             http: http_client(),
             me_cache: Arc::default(),
         };
@@ -3992,6 +4044,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let config = Arc::new(RwLock::new(Config {
             base_url: format!("http://{}", addr),
+            app_url: Some("https://app.nubi.chat".into()),
             token: "t".into(),
             space_id: "s".into(),
             agent_id: Some("me".into()),
@@ -4126,6 +4179,10 @@ mod tests {
             .unwrap();
         assert_eq!(created["room_id"], "new-doc");
         assert_eq!(created["base_version"], 0);
+        assert_eq!(
+            created["url"],
+            "https://app.nubi.chat/dashboard/docs/new-doc"
+        );
         let sent = state.lock().await.created[0].clone();
         assert_eq!(sent["room_type"], "doc");
         assert_eq!(sent["content"], "## Context\n");
