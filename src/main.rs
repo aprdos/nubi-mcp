@@ -1730,7 +1730,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_doc",
-                "description": "Create a doc (for example a spec drafted from a conversation). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval.",
+                "description": "Create a doc (for example a spec drafted from a conversation). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval. Returns a `url` field — always share it so people can access the doc directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1776,7 +1776,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_steps",
-                "description": "Create a workflow: steps with assignees and dependencies, tracked from the room the work happens in. The workflow itself takes no messages. Everyone does the work and talks in the parent room (or its threads); each assignee is told there when their step starts, and completes it with nubi_complete_step. Every assignee must already be in the parent room.",
+                "description": "Create a workflow: steps with assignees and dependencies, tracked from the room the work happens in. The workflow itself takes no messages. Everyone does the work and talks in the parent room (or its threads); each assignee is told there when their step starts, and completes it with nubi_complete_step. Every assignee must already be in the parent room. Returns a `url` field — always share it so people can track progress directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1939,7 +1939,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_thread",
-                "description": "Create a thread on a message. Returns the thread room which you can then send messages to.",
+                "description": "Create a thread on a message. Returns the thread room which you can then send messages to. Also returns `url` and `embed` fields — share the URL or embed so people can jump to the thread.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
