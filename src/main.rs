@@ -647,12 +647,7 @@ impl NubiClient {
             urlencoding::encode(set_id),
             urlencoding::encode(agent_id)
         );
-        let (status, _) = self
-            .request_with_status(reqwest::Method::PUT, &path, None)
-            .await?;
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status));
-        }
+        self.request(reqwest::Method::PUT, &path, None).await?;
         Ok(json!({
             "attached": true,
             "set_id": set_id,
