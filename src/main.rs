@@ -639,17 +639,13 @@ impl NubiClient {
         }))
     }
 
-    /// Attach a skill set to an agent (self-bind).
-    async fn attach_skill_set(&self, set_id: &str) -> Result<Value, String> {
-        let agent_id = self
-            .self_id()
-            .await
-            .ok_or_else(|| "could not determine agent id".to_string())?;
+    /// Attach a skill set to an agent.
+    async fn attach_skill_set(&self, set_id: &str, agent_id: &str) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/skill-sets/{}/agents/{}",
             self.space_id().await,
             urlencoding::encode(set_id),
-            urlencoding::encode(&agent_id)
+            urlencoding::encode(agent_id)
         );
         self.request(reqwest::Method::PUT, &path, None).await?;
         Ok(json!({
@@ -659,19 +655,20 @@ impl NubiClient {
         }))
     }
 
-    /// Detach a skill set from an agent (self-unbind).
-    async fn detach_skill_set(&self, set_id: &str) -> Result<Value, String> {
-        let agent_id = self
-            .self_id()
-            .await
-            .ok_or_else(|| "could not determine agent id".to_string())?;
+    /// Detach a skill set from an agent.
+    async fn detach_skill_set(&self, set_id: &str, agent_id: &str) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/skill-sets/{}/agents/{}",
             self.space_id().await,
             urlencoding::encode(set_id),
-            urlencoding::encode(&agent_id)
+            urlencoding::encode(agent_id)
         );
-        self.request(reqwest::Method::DELETE, &path, None).await?;
+        let (status, _) = self
+            .request_with_status(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status));
+        }
         Ok(json!({
             "detached": true,
             "set_id": set_id,
@@ -1625,24 +1622,26 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_attach_skill_set",
-                "description": "Attach a skill set to yourself. After attaching, call nubi_get_mandate to refresh your mandate with the new skills.",
+                "description": "Attach a skill set to an agent. You cannot attach a skill set to yourself (the engine denies self-binding). After attaching, the target agent should call nubi_get_mandate to refresh their mandate.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "set_id": { "type": "string", "description": "The skill set id to attach" }
+                        "set_id": { "type": "string", "description": "The skill set id to attach" },
+                        "agent_id": { "type": "string", "description": "The agent id to attach the skill set to" }
                     },
-                    "required": ["set_id"]
+                    "required": ["set_id", "agent_id"]
                 }
             },
             {
                 "name": "nubi_detach_skill_set",
-                "description": "Detach a skill set from yourself. After detaching, call nubi_get_mandate to refresh your mandate.",
+                "description": "Detach a skill set from an agent. You cannot detach a skill set from yourself (the engine denies self-unbinding). After detaching, the target agent should call nubi_get_mandate to refresh their mandate.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "set_id": { "type": "string", "description": "The skill set id to detach" }
+                        "set_id": { "type": "string", "description": "The skill set id to detach" },
+                        "agent_id": { "type": "string", "description": "The agent id to detach the skill set from" }
                     },
-                    "required": ["set_id"]
+                    "required": ["set_id", "agent_id"]
                 }
             },
             {
@@ -1937,11 +1936,13 @@ async fn handle_tool_call(
         }
         "nubi_attach_skill_set" => {
             let set_id = args["set_id"].as_str().ok_or("set_id required")?;
-            client.attach_skill_set(set_id).await
+            let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
+            client.attach_skill_set(set_id, agent_id).await
         }
         "nubi_detach_skill_set" => {
             let set_id = args["set_id"].as_str().ok_or("set_id required")?;
-            client.detach_skill_set(set_id).await
+            let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
+            client.detach_skill_set(set_id, agent_id).await
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_get_doc" => {
