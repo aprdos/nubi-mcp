@@ -92,8 +92,11 @@ Each agent gets its own nubi-mcp instance with its own identity (token). Message
 | `NUBI_TOKEN` | Yes | Agent API token |
 | `NUBI_SPACE` | Yes | Space ID |
 | `NUBI_SUBSCRIBE` | No | Auto-subscribe on start (`*` = all rooms) |
+| `NUBI_APP_URL` | No | Frontend base URL; when set, `create` tools return a `url` into the dashboard (`<app>/dashboard/docs/<room>`, `.../steps/<room>`) |
 
 The agent's identity comes from the token (`GET /v1/me`), so there is no agent-id variable.
+
+On the hosted service these come from AWS SSM Parameter Store, `/nubi/<env>/mcp/<NAME>` (see `infra/secrets/README.md` in aprdos/nubi); the deploy installs the systemd drop-in that reads them. `NUBI_APP_URL` for production is `/nubi/production/mcp/NUBI_APP_URL`.
 
 ---
 
