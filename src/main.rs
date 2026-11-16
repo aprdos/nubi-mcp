@@ -851,6 +851,7 @@ impl NubiClient {
         let path = match room_type {
             "doc" => "docs",
             "steps" => "steps",
+            "thread" => "threads",
             _ => return None,
         };
         Some(format!(
@@ -1094,12 +1095,16 @@ impl NubiClient {
             .request(reqwest::Method::POST, &path, Some(body))
             .await?;
         let thread_room_id = meta["id"].as_str().unwrap_or_default();
-        Ok(json!({
+        let mut result = json!({
             "room_id": thread_room_id,
             "name": meta["name"],
             "parent_room_id": room_id,
             "embed": format!("[thread:{}]", thread_room_id),
-        }))
+        });
+        if let Some(url) = self.room_url("thread", thread_room_id).await {
+            result["url"] = json!(url);
+        }
+        Ok(result)
     }
 
     async fn verify_step(
@@ -4004,14 +4009,23 @@ mod tests {
                 .post(|State(s): State<DocState>, axum::Json(body): axum::Json<Value>| async move {
                     let mut d = s.lock().await;
                     d.created.push(body.clone());
-                    let has_content = body.get("content").is_some();
-                    (StatusCode::CREATED, axum::Json(json!({
-                        "id": "new-doc", "name": body["name"],
-                        "kind": {
-                            "type": "doc", "status": "draft",
-                            "current_version": if has_content { json!(0) } else { Value::Null },
-                            "version_count": if has_content { 1 } else { 0 }
+                    let room_type = body["room_type"].as_str().unwrap_or("doc");
+                    let (id, kind) = match room_type {
+                        "steps" => ("new-steps", json!({
+                            "type": "steps",
+                            "steps": body["steps"]
+                        })),
+                        _ => {
+                            let has_content = body.get("content").is_some();
+                            ("new-doc", json!({
+                                "type": "doc", "status": "draft",
+                                "current_version": if has_content { json!(0) } else { Value::Null },
+                                "version_count": if has_content { 1 } else { 0 }
+                            }))
                         }
+                    };
+                    (StatusCode::CREATED, axum::Json(json!({
+                        "id": id, "name": body["name"], "kind": kind
                     })))
                 }),
             )
@@ -4045,6 +4059,16 @@ mod tests {
                     d.versions.push((index, "me", body["content"].as_str().unwrap().to_string()));
                     let number = d.versions.len();
                     axum::Json(json!({ "version": { "index": index, "number": number, "saved_at_ms": 2 } })).into_response()
+                }),
+            )
+            .route(
+                "/v1/spaces/{space}/rooms/{room}/messages/{index}/thread",
+                axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                    (StatusCode::CREATED, axum::Json(json!({
+                        "id": "new-thread",
+                        "name": body.get("name").cloned().unwrap_or(Value::Null),
+                        "kind": { "type": "thread" }
+                    })))
                 }),
             )
             .with_state(state.clone());
@@ -4199,5 +4223,31 @@ mod tests {
         // Blank content is left out, so the doc starts with no version
         client.create_doc("Notes", Some("   "), None).await.unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_steps_includes_url() {
+        let (client, _) = spawn_doc_engine(two_versions()).await;
+        let steps = json!([{"id": "s1", "assignees": ["me"], "description": "Do it"}]);
+        let created = client.create_steps("Deploy", &steps).await.unwrap();
+        assert_eq!(created["room_id"], "new-steps");
+        assert_eq!(
+            created["url"],
+            "https://app.nubi.chat/dashboard/steps/new-steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_thread_includes_url() {
+        let (client, _) = spawn_doc_engine(two_versions()).await;
+        let created = client
+            .create_thread("prd", 1, Some("Discussion"))
+            .await
+            .unwrap();
+        assert_eq!(created["room_id"], "new-thread");
+        assert_eq!(
+            created["url"],
+            "https://app.nubi.chat/dashboard/threads/new-thread"
+        );
     }
 }
