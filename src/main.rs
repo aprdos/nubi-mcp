@@ -3198,6 +3198,21 @@ mod tests {
                     },
                 ),
             )
+            .route(
+                "/v1/spaces/{space}/skill-sets/{set}/agents/{agent}",
+                axum::routing::put(
+                    |State(e): State<MockEngine>, uri: axum::http::Uri| async move {
+                        e.paths.lock().await.push(uri.to_string());
+                        axum::Json(json!({}))
+                    },
+                )
+                .delete(
+                    |State(e): State<MockEngine>, uri: axum::http::Uri| async move {
+                        e.paths.lock().await.push(uri.to_string());
+                        axum::Json(json!({}))
+                    },
+                ),
+            )
             .with_state(engine.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3609,6 +3624,35 @@ mod tests {
                 "/v1/spaces/s/skill-sets?status=published",
                 "/v1/spaces/s/skill-sets/tier%201",
                 "/v1/spaces/s/skill-sets",
+            ]
+        );
+
+        // Test attach/detach (agent binding)
+        let attach = call(
+            &client,
+            &config,
+            "nubi_attach_skill_set",
+            json!({ "set_id": "tier 1" }),
+        )
+        .await;
+        assert!(attach.contains("\"attached\":true"));
+        let detach = call(
+            &client,
+            &config,
+            "nubi_detach_skill_set",
+            json!({ "set_id": "tier 1" }),
+        )
+        .await;
+        assert!(detach.contains("\"detached\":true"));
+        assert_eq!(
+            *engine.paths.lock().await,
+            vec![
+                "/v1/spaces/s/skill-sets",
+                "/v1/spaces/s/skill-sets?status=published",
+                "/v1/spaces/s/skill-sets/tier%201",
+                "/v1/spaces/s/skill-sets",
+                "/v1/spaces/s/skill-sets/tier%201/agents/bot",
+                "/v1/spaces/s/skill-sets/tier%201/agents/bot",
             ]
         );
     }
