@@ -853,7 +853,12 @@ impl NubiClient {
             "steps" => "steps",
             _ => return None,
         };
-        Some(format!("{}/dashboard/{}/{}", app_url.trim_end_matches('/'), path, room_id))
+        Some(format!(
+            "{}/dashboard/{}/{}",
+            app_url.trim_end_matches('/'),
+            path,
+            urlencoding::encode(room_id)
+        ))
     }
 
     async fn list_rooms(&self, kind: Option<&str>) -> Result<Value, String> {
@@ -884,7 +889,9 @@ impl NubiClient {
             "room_type": "steps",
             "steps": { "steps": steps }
         });
-        let meta = self.request(reqwest::Method::POST, &path, Some(body)).await?;
+        let meta = self
+            .request(reqwest::Method::POST, &path, Some(body))
+            .await?;
         let room_id = meta["id"].as_str().unwrap_or_default();
         let mut result = json!({
             "room_id": room_id,
@@ -1083,7 +1090,9 @@ impl NubiClient {
             Some(n) => json!({ "name": n }),
             None => json!({}),
         };
-        let meta = self.request(reqwest::Method::POST, &path, Some(body)).await?;
+        let meta = self
+            .request(reqwest::Method::POST, &path, Some(body))
+            .await?;
         let thread_room_id = meta["id"].as_str().unwrap_or_default();
         Ok(json!({
             "room_id": thread_room_id,
