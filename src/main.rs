@@ -882,13 +882,14 @@ impl NubiClient {
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
-    async fn create_steps(&self, name: &str, steps: &Value) -> Result<Value, String> {
+    async fn create_steps(
+        &self,
+        name: &str,
+        parent_room_id: &str,
+        steps: &Value,
+    ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        let body = json!({
-            "name": name,
-            "room_type": "steps",
-            "steps": { "steps": steps }
-        });
+        let body = create_steps_body(name, parent_room_id, steps);
         let meta = self
             .request(reqwest::Method::POST, &path, Some(body))
             .await?;
@@ -902,6 +903,22 @@ impl NubiClient {
             result["url"] = json!(url);
         }
         Ok(result)
+    }
+
+    async fn complete_step(
+        &self,
+        room_id: &str,
+        step_id: &str,
+        evidence: &Value,
+    ) -> Result<Value, String> {
+        let body = complete_step_body(evidence)?;
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/steps/{}/complete",
+            self.space_id().await,
+            urlencoding::encode(room_id),
+            urlencoding::encode(step_id)
+        );
+        self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
     async fn get_or_create_dm(&self, with_agent: &str) -> Result<Value, String> {
@@ -1759,11 +1776,12 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_steps",
-                "description": "Create a Steps workflow room with a DAG of steps",
+                "description": "Create a workflow: steps with assignees and dependencies, tracked from the room the work happens in. The workflow itself takes no messages. Everyone does the work and talks in the parent room (or its threads); each assignee is told there when their step starts, and completes it with nubi_complete_step. Every assignee must already be in the parent room.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Room name" },
+                        "name": { "type": "string", "description": "The workflow's name" },
+                        "parent_room_id": { "type": "string", "description": "The group or task room the work happens in. Evidence comes from it and the workflow's notices go to it." },
                         "steps": {
                             "type": "array",
                             "description": "Array of step definitions forming a DAG",
@@ -1782,13 +1800,40 @@ fn tools_list_full() -> Value {
                                         "items": { "type": "string" },
                                         "description": "Step IDs this step depends on"
                                     },
-                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" }
+                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" },
+                                    "verifier": { "type": "string", "enum": ["none", "default"], "description": "'default': the workflow's owner reviews the step before it counts as done. 'none' (the default): it is done once completed." },
+                                    "completion_mode": { "type": "string", "enum": ["any", "all"], "description": "With several assignees: 'any' (the default) one of them completes it, 'all' each attaches their own part." }
                                 },
                                 "required": ["id", "assignees", "description"]
                             }
                         }
                     },
-                    "required": ["name", "steps"]
+                    "required": ["name", "parent_room_id", "steps"]
+                }
+            },
+            {
+                "name": "nubi_complete_step",
+                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's parent room (or one of its threads) with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. A workflow takes no messages itself, so never nubi_send to it. Also how you resubmit a step that was sent back for revision.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The workflow (Steps room) id" },
+                        "step_id": { "type": "string", "description": "The step to complete" },
+                        "evidence": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "One or more of your own messages that show the work",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "room_id": { "type": "string", "description": "The parent room, or one of its threads" },
+                                    "index": { "type": "integer", "description": "The message's index in that room" }
+                                },
+                                "required": ["room_id", "index"]
+                            }
+                        }
+                    },
+                    "required": ["room_id", "step_id", "evidence"]
                 }
             },
             {
@@ -2027,9 +2072,19 @@ async fn handle_tool_call(
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
+            let parent = args["parent_room_id"]
+                .as_str()
+                .ok_or("parent_room_id required: the room the work happens in")?;
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             client
-                .create_steps(name, &serde_json::Value::Array(steps.clone()))
+                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
+                .await
+        }
+        "nubi_complete_step" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let step_id = args["step_id"].as_str().ok_or("step_id required")?;
+            client
+                .complete_step(room_id, step_id, &args["evidence"])
                 .await
         }
         "nubi_dm" => {
@@ -2709,9 +2764,95 @@ async fn main() {
     stdout_handle.abort();
 }
 
+/// The body that creates a workflow tracked from `parent_room_id`.
+fn create_steps_body(name: &str, parent_room_id: &str, steps: &Value) -> Value {
+    json!({
+        "name": name,
+        "room_type": "steps",
+        "steps": { "parent_room": parent_room_id, "steps": steps }
+    })
+}
+
+/// The body that completes a step: the evidence as `[{ room_id, index }]`,
+/// checked here so a wrong shape is explained rather than a bare 400.
+fn complete_step_body(evidence: &Value) -> Result<Value, String> {
+    let items = evidence
+        .as_array()
+        .filter(|a| !a.is_empty())
+        .ok_or("evidence required: one or more of your own messages, each as { room_id, index }")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let room_id = item["room_id"]
+            .as_str()
+            .ok_or("each evidence item needs a room_id")?;
+        let index = item["index"]
+            .as_u64()
+            .ok_or("each evidence item needs the message's index (a whole number)")?;
+        out.push(json!({ "room_id": room_id, "index": index }));
+    }
+    Ok(json!({ "evidence": out }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workflow_is_created_from_its_parent_room() {
+        let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
+        let body = create_steps_body("Ship", "work-1", &steps);
+        assert_eq!(body["room_type"], "steps");
+        assert_eq!(body["steps"]["parent_room"], "work-1");
+        assert_eq!(body["steps"]["steps"], steps);
+    }
+
+    #[test]
+    fn completing_a_step_sends_only_room_and_index_per_message() {
+        let body = complete_step_body(&json!([
+            { "room_id": "work-1", "index": 12, "note": "ignored" },
+            { "room_id": "thread.work-1.12", "index": 0 }
+        ]))
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({ "evidence": [
+                { "room_id": "work-1", "index": 12 },
+                { "room_id": "thread.work-1.12", "index": 0 }
+            ] })
+        );
+    }
+
+    #[test]
+    fn completing_a_step_needs_evidence_in_the_right_shape() {
+        for bad in [
+            json!(null),
+            json!([]),
+            json!("work-1"),
+            json!([{ "index": 3 }]),
+            json!([{ "room_id": "work-1" }]),
+            json!([{ "room_id": "work-1", "index": "3" }]),
+            json!([{ "room_id": "work-1", "index": -1 }]),
+        ] {
+            assert!(complete_step_body(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_workflow_tools_are_listed_with_what_they_require() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
+        let create = find("nubi_create_steps");
+        assert!(create["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("parent_room_id")));
+        let complete = find("nubi_complete_step");
+        assert_eq!(
+            complete["inputSchema"]["required"],
+            json!(["room_id", "step_id", "evidence"])
+        );
+    }
 
     #[test]
     fn iso_utc_formats_unix_millis() {
