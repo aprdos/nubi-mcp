@@ -1939,7 +1939,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_thread",
-                "description": "Create a thread on a message. Returns the thread room which you can then send messages to. Also returns `url` and `embed` fields — share the URL or embed so people can jump to the thread.",
+                "description": "Create a thread on a message. Returns the thread room which you can then send messages to. Also returns an `embed` field — share it so people can jump to the thread.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
