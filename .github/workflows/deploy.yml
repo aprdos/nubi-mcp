@@ -96,7 +96,7 @@ jobs:
         run: |
           case "$TARGET_ENV" in staging|production) ;; *) echo "unknown environment"; exit 1 ;; esac
           ssh -i ~/.ssh/deploy_key admin@${{ secrets.DEPLOY_HOST }} "TARGET_ENV=\"$TARGET_ENV\" bash -s" << 'EOF'
-            set -e
+            set -eo pipefail
             if [ ! -x /usr/local/bin/nubi-secrets ]; then
               echo "==> nubi-secrets not installed on this host; skipping SSM drop-in"
               exit 0
