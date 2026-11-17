@@ -1813,7 +1813,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_complete_step",
-                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's thread with nubi_send (for an older workflow tracked from a room: that room or one of its threads), then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. A workflow takes no messages itself, so never nubi_send to it. Also how you resubmit a step that was sent back for revision.",
+                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's thread with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. A workflow takes no messages itself, so never nubi_send to it. Also how you resubmit a step that was sent back for revision.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1826,7 +1826,7 @@ fn tools_list_full() -> Value {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "room_id": { "type": "string", "description": "The workflow's thread (older workflows: its room, or one of its threads)" },
+                                    "room_id": { "type": "string", "description": "The workflow's thread" },
                                     "index": { "type": "integer", "description": "The message's index in that room" }
                                 },
                                 "required": ["room_id", "index"]
