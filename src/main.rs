@@ -1037,31 +1037,30 @@ impl NubiClient {
         &self,
         query: &str,
         room_ids: Option<Vec<String>>,
-        limit: Option<u64>,
-        cursor: Option<String>,
+        limit: u64,
+        cursor: SearchCursor,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/search", self.space_id().await);
-
-        // Split query into terms (whitespace-separated)
-        let terms: Vec<&str> = query.split_whitespace().collect();
-        if terms.is_empty() {
-            return Err("query cannot be empty".to_string());
-        }
-
-        let mut body = json!({ "terms": terms });
-        if let Some(ids) = room_ids {
-            if !ids.is_empty() {
-                body["room_ids"] = json!(ids);
-            }
-        }
-        if let Some(l) = limit {
-            body["limit"] = json!(l);
-        }
-        if let Some(c) = cursor {
-            body["cursor"] = json!(c);
-        }
-
+        let body = search_body(query, room_ids, limit, cursor)?;
         self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    /// Room id → display name for the rooms the caller belongs to. Threads
+    /// and DMs have no name of their own and are left out.
+    async fn room_names(&self) -> HashMap<String, String> {
+        let Ok(rooms) = self.list_rooms(None).await else {
+            return HashMap::new();
+        };
+        rooms
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let id = r["id"].as_str()?;
+                let name = r["name"].as_str().filter(|n| !n.is_empty())?;
+                Some((id.to_string(), name.to_string()))
+            })
+            .collect()
     }
 
     async fn list_agents(&self) -> Result<Value, String> {
@@ -1885,15 +1884,15 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_search",
-                "description": "Search messages across rooms. Returns matching messages with room context. Use for targeted retrieval instead of scrolling through history.",
+                "description": "Find messages across rooms instead of scrolling through history. Every word must match; words are matched by their stem and as prefixes, so \"deploy\" also finds \"deployed\" and \"deployment\", and case does not matter. Use a few distinctive words, not a sentence. Returns {results: [{room, room_name, index, from, at, text}], has_more, next_cursor}, newest first. To read around a hit, nubi_poll that room with before_index set to the hit's index + 1. When has_more is true, call again with the same query and cursor=next_cursor.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Search query. Multiple words are AND-ed together." },
-                        "room_id": { "type": "string", "description": "Single room to search. Use room_ids for multiple rooms." },
-                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Rooms to search. Omit to search all rooms you can read." },
-                        "limit": { "type": "number", "description": "Max results to return (default 50)." },
-                        "cursor": { "type": "string", "description": "Pagination cursor from previous response." }
+                        "query": { "type": "string", "description": "Words to find. All must match." },
+                        "room_id": { "type": "string", "description": "Only this room. Use room_ids for several." },
+                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Only these rooms. Omit to search every room you can read." },
+                        "limit": { "type": "number", "description": "Hits per page (default 20, at most 100)." },
+                        "cursor": { "type": "string", "description": "next_cursor from the previous result, to get the next page. Keep the query and rooms the same." }
                     },
                     "required": ["query"]
                 }
@@ -2143,9 +2142,21 @@ async fn handle_tool_call(
                 (_, Some(Value::String(id))) => Some(vec![id.clone()]),
                 _ => None,
             };
-            let limit = args["limit"].as_u64();
-            let cursor = args["cursor"].as_str().map(String::from);
-            client.search(query, room_ids, limit, cursor).await
+            let limit = args["limit"]
+                .as_u64()
+                .unwrap_or(SEARCH_DEFAULT_LIMIT)
+                .clamp(1, SEARCH_MAX_LIMIT);
+            let cursor = match args["cursor"].as_str() {
+                Some(c) => SearchCursor::parse(c)?,
+                None => SearchCursor::default(),
+            };
+            let result = client.search(query, room_ids, limit, cursor).await?;
+            let names = if result["results"].as_array().is_some_and(|r| !r.is_empty()) {
+                client.room_names().await
+            } else {
+                HashMap::new()
+            };
+            Ok(compact_search(result, cursor, &names))
         }
         "nubi_list_agents" => client.list_agents().await,
         "nubi_invite" => {
@@ -2793,6 +2804,132 @@ fn complete_step_body(evidence: &Value) -> Result<Value, String> {
     Ok(json!({ "evidence": out }))
 }
 
+/// Hits per search page when the caller does not say.
+const SEARCH_DEFAULT_LIMIT: u64 = 20;
+/// The engine's own ceiling.
+const SEARCH_MAX_LIMIT: u64 = 100;
+/// The engine takes at most this many terms; words past it go into the last.
+const SEARCH_MAX_TERMS: usize = 10;
+
+/// Where a search page starts. The engine searches rooms in batches
+/// (`rooms_offset`) and pages hits within a batch (`offset`); the model sees
+/// both as one opaque `cursor`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SearchCursor {
+    rooms_offset: u64,
+    offset: u64,
+}
+
+impl SearchCursor {
+    fn parse(s: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "invalid cursor '{}': pass next_cursor from the previous nubi_search result unchanged",
+                s
+            )
+        };
+        let (rooms, hits) = s.trim().split_once(':').ok_or_else(bad)?;
+        Ok(Self {
+            rooms_offset: rooms.parse().map_err(|_| bad())?,
+            offset: hits.parse().map_err(|_| bad())?,
+        })
+    }
+
+    fn encode(self) -> String {
+        format!("{}:{}", self.rooms_offset, self.offset)
+    }
+
+    /// The page after one the engine answered from this cursor, if any: the
+    /// next hits of the same room batch first, then the next room batch.
+    fn next(self, response: &Value) -> Option<Self> {
+        if let Some(offset) = response["next_offset"].as_u64() {
+            return Some(Self { offset, ..self });
+        }
+        let searched = response["rooms_searched"].as_array().map_or(0, Vec::len) as u64;
+        (response["rooms_remaining"].as_u64().unwrap_or(0) > 0 && searched > 0).then_some(Self {
+            rooms_offset: self.rooms_offset + searched,
+            offset: 0,
+        })
+    }
+}
+
+/// The engine's search request for `query`: one term per word, AND-ed.
+fn search_body(
+    query: &str,
+    room_ids: Option<Vec<String>>,
+    limit: u64,
+    cursor: SearchCursor,
+) -> Result<Value, String> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return Err("query cannot be empty".to_string());
+    }
+    // A term may hold several words, all of which must match, so folding the
+    // overflow into the last term keeps the query's meaning.
+    let mut terms: Vec<String> = words
+        .iter()
+        .take(SEARCH_MAX_TERMS - 1)
+        .map(|w| w.to_string())
+        .collect();
+    if words.len() >= SEARCH_MAX_TERMS {
+        terms.push(words[SEARCH_MAX_TERMS - 1..].join(" "));
+    }
+
+    let mut body = json!({
+        "terms": terms,
+        "limit": limit,
+        "rooms_offset": cursor.rooms_offset,
+        "offset": cursor.offset,
+    });
+    if let Some(ids) = room_ids.filter(|ids| !ids.is_empty()) {
+        body["room_ids"] = json!(ids);
+    }
+    Ok(body)
+}
+
+/// What the model reads from a search: each hit as `{room, room_name, index,
+/// from, at, text}`, and `next_cursor` while there is more. `index` is the
+/// message's index in `room`, ready for `nubi_poll` or `nubi_create_thread`.
+fn compact_search(v: Value, cursor: SearchCursor, names: &HashMap<String, String>) -> Value {
+    let Some(hits) = v["results"].as_array() else {
+        return v;
+    };
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|h| {
+            let mut m = serde_json::Map::new();
+            m.insert("room".into(), h["room_id"].clone());
+            if let Some(name) = h["room_id"].as_str().and_then(|id| names.get(id)) {
+                m.insert("room_name".into(), json!(name));
+            }
+            m.insert("index".into(), h["global_index"].clone());
+            m.insert("from".into(), h["sender"].clone());
+            if let Some(at) = h["timestamp"].as_str() {
+                m.insert("at".into(), json!(short_rfc3339(at)));
+            }
+            m.insert("text".into(), h["text"].clone());
+            Value::Object(m)
+        })
+        .collect();
+
+    let next = cursor.next(&v);
+    let mut out = json!({ "results": results, "has_more": next.is_some() });
+    if let Some(next) = next {
+        out["next_cursor"] = json!(next.encode());
+    }
+    out
+}
+
+/// `2026-11-03T08:47:02.123+00:00` → `2026-11-03T08:47:02Z`, the form
+/// `nubi_poll` uses. Anything else is passed through.
+fn short_rfc3339(ts: &str) -> String {
+    let utc = ts.ends_with("+00:00") || ts.ends_with('Z');
+    match (utc, ts.get(..19)) {
+        (true, Some(head)) if ts.as_bytes().get(10) == Some(&b'T') => format!("{}Z", head),
+        _ => ts.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2907,6 +3044,139 @@ mod tests {
         let v = json!({"error": "nope"});
         assert_eq!(compact_poll(v.clone()), v);
     }
+
+    #[test]
+    fn a_search_cursor_round_trips_and_rejects_anything_else() {
+        let c = SearchCursor {
+            rooms_offset: 200,
+            offset: 40,
+        };
+        assert_eq!(SearchCursor::parse(&c.encode()), Ok(c));
+        for bad in ["", "abc", "1", "1:x", "-1:0", "eyJ0IjoxfQ=="] {
+            assert!(
+                SearchCursor::parse(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_search_sends_the_engines_paging_fields_not_a_cursor() {
+        let cursor = SearchCursor {
+            rooms_offset: 200,
+            offset: 40,
+        };
+        let body = search_body("deploy  failed", Some(vec!["r1".into()]), 20, cursor).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "terms": ["deploy", "failed"],
+                "limit": 20,
+                "rooms_offset": 200,
+                "offset": 40,
+                "room_ids": ["r1"],
+            })
+        );
+        assert!(search_body("   ", None, 20, cursor).is_err());
+        assert!(search_body("x", Some(vec![]), 20, cursor)
+            .unwrap()
+            .get("room_ids")
+            .is_none());
+    }
+
+    #[test]
+    fn a_long_search_query_keeps_every_word_within_the_term_limit() {
+        let query = (1..=13)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = search_body(&query, None, 20, SearchCursor::default()).unwrap();
+        let terms = body["terms"].as_array().unwrap();
+        assert_eq!(terms.len(), SEARCH_MAX_TERMS);
+        assert_eq!(terms[9], "w10 w11 w12 w13");
+
+        let exact = (1..=10)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = search_body(&exact, None, 20, SearchCursor::default()).unwrap();
+        assert_eq!(body["terms"].as_array().unwrap().len(), 10);
+        assert_eq!(body["terms"][9], "w10");
+    }
+
+    #[test]
+    fn search_pages_through_hits_then_through_room_batches() {
+        let start = SearchCursor {
+            rooms_offset: 0,
+            offset: 0,
+        };
+        // More hits in this batch: same rooms, next offset.
+        let more_hits = json!({"results": [{}], "next_offset": 20, "rooms_searched": ["a", "b"], "rooms_remaining": 5});
+        assert_eq!(
+            start.next(&more_hits),
+            Some(SearchCursor {
+                rooms_offset: 0,
+                offset: 20
+            })
+        );
+        // Batch done, rooms left: next batch from its first hit.
+        let at = SearchCursor {
+            rooms_offset: 0,
+            offset: 20,
+        };
+        let batch_done = json!({"results": [{}], "next_offset": null, "rooms_searched": ["a", "b"], "rooms_remaining": 5});
+        assert_eq!(
+            at.next(&batch_done),
+            Some(SearchCursor {
+                rooms_offset: 2,
+                offset: 0
+            })
+        );
+        // Nothing left.
+        let done = json!({"results": [], "next_offset": null, "rooms_searched": ["a"], "rooms_remaining": 0});
+        assert_eq!(at.next(&done), None);
+    }
+
+    #[test]
+    fn search_hits_keep_what_the_model_reads() {
+        let engine = json!({
+            "results": [
+                {"room_id": "r1", "global_index": 7, "sender": "ana", "text": "deploy failed", "timestamp": "2026-11-03T08:47:02.123+00:00"},
+                {"room_id": "t9", "global_index": 2, "sender": "bo", "text": "retrying", "timestamp": "2026-11-03T09:00:00+07:00"}
+            ],
+            "has_more": true,
+            "next_offset": 2,
+            "rooms_searched": ["r1", "t9"],
+            "rooms_remaining": 0
+        });
+        let names = HashMap::from([("r1".to_string(), "ops".to_string())]);
+        let out = compact_search(engine, SearchCursor::default(), &names);
+        assert_eq!(
+            out,
+            json!({
+                "results": [
+                    {"room": "r1", "room_name": "ops", "index": 7, "from": "ana", "at": "2026-11-03T08:47:02Z", "text": "deploy failed"},
+                    {"room": "t9", "index": 2, "from": "bo", "at": "2026-11-03T09:00:00+07:00", "text": "retrying"}
+                ],
+                "has_more": true,
+                "next_cursor": "0:2"
+            })
+        );
+        // The last page says so and offers no cursor.
+        let last = compact_search(
+            json!({"results": [], "has_more": false, "next_offset": null, "rooms_searched": [], "rooms_remaining": 0}),
+            SearchCursor::default(),
+            &names,
+        );
+        assert_eq!(last, json!({"results": [], "has_more": false}));
+        // An error body is passed through.
+        let err = json!({"error": "search is not enabled"});
+        assert_eq!(
+            compact_search(err.clone(), SearchCursor::default(), &names),
+            err
+        );
+    }
+
     use axum::routing::get;
     use std::future::Future;
     use std::pin::Pin;
@@ -3206,8 +3476,8 @@ mod tests {
             .search(
                 "error timeout",
                 Some(vec!["room-1".into(), "room-2".into()]),
-                Some(25),
-                None,
+                25,
+                SearchCursor::default(),
             )
             .await
             .unwrap();
@@ -3217,6 +3487,8 @@ mod tests {
         assert_eq!(req["room_ids"], json!(["room-1", "room-2"]));
         assert_eq!(req["limit"], json!(25));
         assert!(req.get("cursor").is_none());
+        assert_eq!(req["rooms_offset"], 0);
+        assert_eq!(req["offset"], 0);
 
         assert_eq!(result["results"][0]["room_id"], "room-1");
         assert_eq!(result["has_more"], false);
@@ -3225,7 +3497,10 @@ mod tests {
     #[tokio::test]
     async fn search_omits_room_ids_when_none() {
         let (client, requests) = spawn_search_sink().await;
-        client.search("keyword", None, None, None).await.unwrap();
+        client
+            .search("keyword", None, 20, SearchCursor::default())
+            .await
+            .unwrap();
 
         let req = &requests.lock().await[0];
         assert_eq!(req["terms"], json!(["keyword"]));
@@ -3233,15 +3508,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_includes_cursor_for_pagination() {
+    async fn search_pages_with_the_engines_offsets() {
         let (client, requests) = spawn_search_sink().await;
-        client
-            .search("query", None, None, Some("cursor123".into()))
-            .await
-            .unwrap();
+        let cursor = SearchCursor::parse("200:40").unwrap();
+        client.search("query", None, 20, cursor).await.unwrap();
 
         let req = &requests.lock().await[0];
-        assert_eq!(req["cursor"], "cursor123");
+        assert_eq!(req["rooms_offset"], 200);
+        assert_eq!(req["offset"], 40);
+        assert!(req.get("cursor").is_none());
     }
 
     /// An engine that ignores `?kind=` and `?status=` and returns every room,
