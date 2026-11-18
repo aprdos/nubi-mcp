@@ -1,10 +1,10 @@
 #![recursion_limit = "256"]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -552,7 +552,7 @@ impl NubiClient {
             state.checked_at = Some(Instant::now());
         }
         if let Err(e) = self.fetch_mandate().await {
-            eprintln!("nubi: mandate check failed: {}", e);
+            tracing::warn!("mandate check failed: {}", e);
         }
     }
 
@@ -561,11 +561,11 @@ impl NubiClient {
         match tokio::time::timeout(MANDATE_INIT_TIMEOUT, self.fetch_mandate()).await {
             Ok(Ok(body)) => body,
             Ok(Err(e)) => {
-                eprintln!("nubi: mandate unavailable at initialize: {}", e);
+                tracing::warn!("mandate unavailable at initialize: {}", e);
                 None
             }
             Err(_) => {
-                eprintln!("nubi: mandate fetch timed out at initialize");
+                tracing::warn!("mandate fetch timed out at initialize");
                 None
             }
         }
@@ -1325,8 +1325,8 @@ async fn run_subscription(
         match outcome {
             Outcome::Disconnected => delay_ms = RECONNECT_MIN_DELAY_MS,
             Outcome::ConnectFailed(err) => {
-                eprintln!(
-                    "nubi: stream {} reconnect in {}ms: {}",
+                tracing::warn!(
+                    "stream {} reconnect in {}ms: {}",
                     target.key(),
                     delay_ms,
                     err
@@ -1396,7 +1396,7 @@ async fn stream_once(
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("nubi: stream {} broke: {}", target.key(), e);
+                tracing::warn!("stream {} broke: {}", target.key(), e);
                 return Outcome::Disconnected;
             }
         };
@@ -2570,14 +2570,14 @@ async fn handle_http_request(
                 match me.client(state, token).0.fetch_mandate().await {
                     Ok(body) => body,
                     Err(e) => {
-                        eprintln!("nubi: mandate unavailable at initialize: {}", e);
+                        tracing::warn!("mandate unavailable at initialize: {}", e);
                         None
                     }
                 }
             })
             .await
             .unwrap_or_else(|_| {
-                eprintln!("nubi: mandate fetch timed out at initialize");
+                tracing::warn!("mandate fetch timed out at initialize");
                 None
             });
             rpc_ok(req.id, initialize_result(&req.params, mandate.as_ref()))
@@ -2627,8 +2627,20 @@ fn record_http_request(method: &str, route: &str, status: u16, start: Instant) {
         .record(start.elapsed().as_secs_f64());
 }
 
+static KNOWN_TOOLS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    tools_list_full()["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+});
+
 fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
-    let safe_tool = if tool.starts_with("nubi_") {
+    let safe_tool = if KNOWN_TOOLS.contains(tool) {
         tool
     } else {
         "unknown"
@@ -2699,11 +2711,23 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
     response
 }
 
-fn init_telemetry() -> Option<PrometheusHandle> {
+fn init_telemetry(json_logs: bool) -> Option<PrometheusHandle> {
+    use tracing_subscriber::Layer;
+
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    let fmt_layer = tracing_subscriber::fmt::layer().json().with_target(true);
+    let fmt_layer: Box<dyn Layer<_> + Send + Sync> = if json_logs {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .boxed()
+    };
 
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
@@ -2732,9 +2756,13 @@ fn init_telemetry() -> Option<PrometheusHandle> {
         registry.init();
     }
 
-    metrics_exporter_prometheus::PrometheusBuilder::new()
-        .install_recorder()
-        .ok()
+    if json_logs {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .install_recorder()
+            .ok()
+    } else {
+        None
+    }
 }
 
 async fn run_http(addr: SocketAddr, metrics_handle: Option<PrometheusHandle>) {
@@ -2793,22 +2821,24 @@ async fn serve_metrics(State(state): State<HttpState>) -> impl IntoResponse {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    let is_http = args.http.is_some();
 
-    let metrics_handle = init_telemetry();
+    let metrics_handle = init_telemetry(is_http);
 
     if let Some(addr) = args.http {
         run_http(addr, metrics_handle).await;
+        opentelemetry::global::shutdown_tracer_provider();
         return;
     }
 
     let config = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Config error: {}", e);
-            eprintln!("Required: NUBI_TOKEN or NUBI_TOKEN_FILE, NUBI_SPACE");
-            eprintln!("Optional: NUBI_URL (default: http://127.0.0.1:8080)");
-            eprintln!(
-                "Optional: NUBI_SUBSCRIBE (\"*\" for all rooms, or a comma-separated room list; mentions only)"
+            tracing::error!("config error: {}", e);
+            tracing::error!("required: NUBI_TOKEN or NUBI_TOKEN_FILE, NUBI_SPACE");
+            tracing::error!("optional: NUBI_URL (default: http://127.0.0.1:8080)");
+            tracing::error!(
+                "optional: NUBI_SUBSCRIBE (\"*\" for all rooms, or a comma-separated room list; mentions only)"
             );
             std::process::exit(1);
         }
@@ -2825,7 +2855,7 @@ async fn main() {
     // noise rather than push. Call nubi_subscribe for the unfiltered firehose.
     if let Some(spec) = config.read().await.subscribe.clone() {
         for target in startup_targets(&spec) {
-            eprintln!("nubi: subscribing to {} (mentions only)", target.key());
+            tracing::info!("subscribing to {} (mentions only)", target.key());
             spawn_subscription(
                 &subscriptions,
                 &config,
@@ -2865,7 +2895,7 @@ async fn main() {
         let req: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Parse error: {}", e);
+                tracing::warn!("parse error: {}", e);
                 continue;
             }
         };
@@ -4745,5 +4775,15 @@ mod tests {
     fn record_tool_call_does_not_panic() {
         record_tool_call("nubi_send", false, Instant::now());
         record_tool_call("nubi_poll", true, Instant::now());
+    }
+
+    #[test]
+    fn unknown_tool_maps_to_unknown_label() {
+        assert!(KNOWN_TOOLS.contains("nubi_send"));
+        assert!(KNOWN_TOOLS.contains("nubi_poll"));
+        assert!(!KNOWN_TOOLS.contains("nubi_bogus"));
+        assert!(!KNOWN_TOOLS.contains("evil_tool"));
+        record_tool_call("nubi_bogus", false, Instant::now());
+        record_tool_call("evil_tool", false, Instant::now());
     }
 }
