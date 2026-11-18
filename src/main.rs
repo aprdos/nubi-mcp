@@ -2372,10 +2372,11 @@ async fn resolve_me(state: &HttpState, token: &str) -> Result<Me, String> {
             .as_str()
             .ok_or("engine /v1/me returned no space_id")?
             .to_string(),
-        agent_id: body["agent_id"]
-            .as_str()
-            .ok_or("engine /v1/me returned no agent_id")?
-            .to_string(),
+        agent_id: normalize_agent_name(
+            body["agent_id"]
+                .as_str()
+                .ok_or("engine /v1/me returned no agent_id")?,
+        ),
         mandate: Arc::default(),
     };
 
