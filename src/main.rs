@@ -12,9 +12,11 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use clap::Parser;
 use futures::StreamExt;
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tracing_subscriber::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "nubi-mcp", about = "MCP server for nubi")]
@@ -2239,6 +2241,10 @@ async fn call_tool(
     subscriptions: &Subscriptions,
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Value {
+    let start = Instant::now();
+    let span = tracing::info_span!("mcp.tool", tool = name);
+    let _guard = span.enter();
+
     // nubi_get_mandate resolves the mandate itself, and its body already
     // says everything the header would.
     let is_mandate_tool = name == "nubi_get_mandate";
@@ -2252,6 +2258,8 @@ async fn call_tool(
         Ok(v) => (serde_json::to_string(&v).unwrap(), false),
         Err(e) => (format!("Error: {}", e), true),
     };
+
+    record_tool_call(name, is_error, start);
 
     let header = if is_mandate_tool || is_error {
         None
@@ -2314,6 +2322,7 @@ struct HttpState {
     /// Only successfully authenticated tokens are cached, so size is
     /// bounded by the number of valid keys in the engine.
     me_cache: Arc<RwLock<HashMap<String, Me>>>,
+    metrics_handle: Option<PrometheusHandle>,
 }
 
 #[derive(Clone)]
@@ -2608,7 +2617,33 @@ async fn handle_http_request(
     }
 }
 
+fn record_http_request(method: &str, route: &str, status: u16, start: Instant) {
+    let labels = [
+        ("method", method.to_string()),
+        ("route", route.to_string()),
+        ("status", status.to_string()),
+    ];
+    metrics::counter!("nubi_mcp_http_requests_total", &labels).increment(1);
+    metrics::histogram!("nubi_mcp_http_request_duration_seconds", &labels[..2])
+        .record(start.elapsed().as_secs_f64());
+}
+
+fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
+    let status = if is_error { "error" } else { "ok" };
+    let labels = [
+        ("tool", tool.to_string()),
+        ("status", status.to_string()),
+    ];
+    metrics::counter!("nubi_mcp_tool_calls_total", &labels).increment(1);
+    metrics::histogram!("nubi_mcp_tool_duration_seconds", &[("tool", tool.to_string())])
+        .record(start.elapsed().as_secs_f64());
+}
+
 async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
+    let start = Instant::now();
+    let span = tracing::info_span!("mcp.http.request", http.method = "POST", http.route = "/mcp");
+    let _guard = span.enter();
+
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -2616,6 +2651,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
         .map(|t| t.trim().to_string());
 
     let Some(token) = token else {
+        record_http_request("POST", "/mcp", 401, start);
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -2627,6 +2663,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
     let msg: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
+            record_http_request("POST", "/mcp", 400, start);
             return axum::Json(rpc_err(Value::Null, -32700, format!("parse error: {}", e)))
                 .into_response()
         }
@@ -2634,12 +2671,14 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
 
     // Notifications and responses carry no id; acknowledge without a body.
     if msg.get("id").is_none_or(Value::is_null) {
+        record_http_request("POST", "/mcp", 202, start);
         return StatusCode::ACCEPTED.into_response();
     }
 
     let req: JsonRpcRequest = match serde_json::from_value(msg) {
         Ok(r) => r,
         Err(e) => {
+            record_http_request("POST", "/mcp", 400, start);
             return axum::Json(rpc_err(
                 Value::Null,
                 -32600,
@@ -2649,10 +2688,50 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
         }
     };
 
-    axum::Json(handle_http_request(&state, &token, req).await).into_response()
+    let response = axum::Json(handle_http_request(&state, &token, req).await).into_response();
+    record_http_request("POST", "/mcp", 200, start);
+    response
 }
 
-async fn run_http(addr: SocketAddr) {
+fn init_telemetry() -> Option<PrometheusHandle> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer().json().with_target(true);
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .expect("failed to create OTLP span exporter");
+
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_resource(opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new(
+                    "service.name",
+                    std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "nubi-mcp".into()),
+                ),
+            ]))
+            .build();
+
+        let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "nubi-mcp");
+        let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
+
+        registry.with(otel_layer).init();
+    } else {
+        registry.init();
+    }
+
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .ok();
+    handle
+}
+
+async fn run_http(addr: SocketAddr, metrics_handle: Option<PrometheusHandle>) {
     let base_url = std::env::var("NUBI_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let app_url = std::env::var("NUBI_APP_URL").ok();
     let state = HttpState {
@@ -2660,29 +2739,44 @@ async fn run_http(addr: SocketAddr) {
         app_url,
         http: http_client(),
         me_cache: Arc::new(RwLock::new(HashMap::new())),
+        metrics_handle,
     };
 
     let app = axum::Router::new()
         .route("/mcp", axum::routing::post(mcp_post))
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route("/metrics", axum::routing::get(serve_metrics))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to bind {}: {}", addr, e);
+            tracing::error!("failed to bind {}: {}", addr, e);
             std::process::exit(1);
         }
     };
 
-    eprintln!(
-        "nubi-mcp hosted mode on http://{}/mcp (engine: {})",
-        addr, base_url
-    );
+    tracing::info!("nubi-mcp hosted mode on http://{}/mcp (engine: {})", addr, base_url);
 
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("server error: {}", e);
+        tracing::error!("server error: {}", e);
         std::process::exit(1);
+    }
+}
+
+async fn serve_metrics(State(state): State<HttpState>) -> impl IntoResponse {
+    if let Some(ref handle) = state.metrics_handle {
+        (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            handle.render(),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+            "# metrics not configured\n".to_string(),
+        )
     }
 }
 
@@ -2690,8 +2784,10 @@ async fn run_http(addr: SocketAddr) {
 async fn main() {
     let args = Args::parse();
 
+    let metrics_handle = init_telemetry();
+
     if let Some(addr) = args.http {
-        run_http(addr).await;
+        run_http(addr, metrics_handle).await;
         return;
     }
 
@@ -4018,6 +4114,7 @@ mod tests {
             app_url: None,
             http: reqwest::Client::new(),
             me_cache: Arc::default(),
+            metrics_handle: None,
         };
         let rpc = |method: &str, params: Value| JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -4303,6 +4400,7 @@ mod tests {
             app_url: None,
             http: reqwest::Client::new(),
             me_cache: Arc::default(),
+            metrics_handle: None,
         };
         let rpc = |method: &str, params: Value| JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -4344,6 +4442,7 @@ mod tests {
             app_url: None,
             http: http_client(),
             me_cache: Arc::default(),
+            metrics_handle: None,
         };
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -4624,5 +4723,17 @@ mod tests {
         // Blank content is left out, so the doc starts with no version
         client.create_doc("Notes", Some("   "), None).await.unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
+    }
+
+    #[test]
+    fn record_http_request_does_not_panic() {
+        record_http_request("GET", "/mcp", 200, Instant::now());
+        record_http_request("POST", "/mcp", 401, Instant::now());
+    }
+
+    #[test]
+    fn record_tool_call_does_not_panic() {
+        record_tool_call("nubi_send", false, Instant::now());
+        record_tool_call("nubi_poll", true, Instant::now());
     }
 }
