@@ -1774,12 +1774,12 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_steps",
-                "description": "Create a workflow: steps with assignees and dependencies, tracked from the thread the work happens in. Its parent must be a thread in a group or task room (not a channel itself, not a DM): start a thread on the message the work is about with nubi_create_thread first. The workflow itself takes no messages; everyone works and talks in that thread, each assignee is told there when their step starts, and completes it with nubi_complete_step. Every assignee must be able to post in the thread. One workflow per piece of work: if one is already running for it (a PR, a task), continue or update that one instead of creating another for each commit or review round. Returns a `url` field — always share it so people can track progress directly.",
+                "description": "Create a workflow: steps with assignees and dependencies, tracked from the thread the work happens in. Its parent must be a thread in a group or task room (not a channel itself, not a DM): start a thread on the message the work is about with nubi_create_thread first. Work, discussion, and evidence all happen inside the Steps room; each assignee is told in the Steps room when their step starts, and completes it with nubi_complete_step. Every assignee must be able to post in the thread. One workflow per piece of work: if one is already running for it (a PR, a task), continue or update that one instead of creating another for each commit or review round. Returns a `url` field — always share it so people can track progress directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The workflow's name" },
-                        "parent_room_id": { "type": "string", "description": "The thread the work happens in (`thread.{room}.{index}`), in a group or task room. Evidence comes from it and the workflow's notices go to it." },
+                        "parent_room_id": { "type": "string", "description": "The thread the work happens in (`thread.{room}.{index}`), in a group or task room." },
                         "steps": {
                             "type": "array",
                             "description": "Array of step definitions forming a DAG",
@@ -1811,7 +1811,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_complete_step",
-                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's thread with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. A workflow takes no messages itself, so never nubi_send to it. Also how you resubmit a step that was sent back for revision.",
+                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's Steps room with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. Also how you resubmit a step that was sent back for revision.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1824,7 +1824,7 @@ fn tools_list_full() -> Value {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "room_id": { "type": "string", "description": "The workflow's thread" },
+                                    "room_id": { "type": "string", "description": "The Steps room itself" },
                                     "index": { "type": "integer", "description": "The message's index in that room" }
                                 },
                                 "required": ["room_id", "index"]
