@@ -2729,10 +2729,9 @@ fn init_telemetry() -> Option<PrometheusHandle> {
         registry.init();
     }
 
-    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+    metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
-        .ok();
-    handle
+        .ok()
 }
 
 async fn run_http(addr: SocketAddr, metrics_handle: Option<PrometheusHandle>) {
