@@ -2630,18 +2630,22 @@ fn record_http_request(method: &str, route: &str, status: u16, start: Instant) {
 
 fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
     let status = if is_error { "error" } else { "ok" };
-    let labels = [
-        ("tool", tool.to_string()),
-        ("status", status.to_string()),
-    ];
+    let labels = [("tool", tool.to_string()), ("status", status.to_string())];
     metrics::counter!("nubi_mcp_tool_calls_total", &labels).increment(1);
-    metrics::histogram!("nubi_mcp_tool_duration_seconds", &[("tool", tool.to_string())])
-        .record(start.elapsed().as_secs_f64());
+    metrics::histogram!(
+        "nubi_mcp_tool_duration_seconds",
+        &[("tool", tool.to_string())]
+    )
+    .record(start.elapsed().as_secs_f64());
 }
 
 async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
     let start = Instant::now();
-    let span = tracing::info_span!("mcp.http.request", http.method = "POST", http.route = "/mcp");
+    let span = tracing::info_span!(
+        "mcp.http.request",
+        http.method = "POST",
+        http.route = "/mcp"
+    );
     let _guard = span.enter();
 
     let token = headers
@@ -2665,7 +2669,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
         Err(e) => {
             record_http_request("POST", "/mcp", 400, start);
             return axum::Json(rpc_err(Value::Null, -32700, format!("parse error: {}", e)))
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2684,7 +2688,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
                 -32600,
                 format!("invalid request: {}", e),
             ))
-            .into_response()
+            .into_response();
         }
     };
 
@@ -2756,7 +2760,11 @@ async fn run_http(addr: SocketAddr, metrics_handle: Option<PrometheusHandle>) {
         }
     };
 
-    tracing::info!("nubi-mcp hosted mode on http://{}/mcp (engine: {})", addr, base_url);
+    tracing::info!(
+        "nubi-mcp hosted mode on http://{}/mcp (engine: {})",
+        addr,
+        base_url
+    );
 
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("server error: {}", e);
