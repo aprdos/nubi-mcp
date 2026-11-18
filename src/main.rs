@@ -2233,6 +2233,7 @@ async fn handle_tool_call(
 /// successful result gets the one-line mandate header as its own leading
 /// text block, so the tool's JSON stays exactly what it would be without a
 /// mandate; errors carry no header. Shared by stdio and hosted mode.
+#[tracing::instrument(name = "mcp.tool", skip_all, fields(tool = name))]
 async fn call_tool(
     client: &NubiClient,
     name: &str,
@@ -2242,8 +2243,6 @@ async fn call_tool(
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Value {
     let start = Instant::now();
-    let span = tracing::info_span!("mcp.tool", tool = name);
-    let _guard = span.enter();
 
     // nubi_get_mandate resolves the mandate itself, and its body already
     // says everything the header would.
@@ -2629,24 +2628,27 @@ fn record_http_request(method: &str, route: &str, status: u16, start: Instant) {
 }
 
 fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
+    let safe_tool = if tool.starts_with("nubi_") {
+        tool
+    } else {
+        "unknown"
+    };
     let status = if is_error { "error" } else { "ok" };
-    let labels = [("tool", tool.to_string()), ("status", status.to_string())];
+    let labels = [
+        ("tool", safe_tool.to_string()),
+        ("status", status.to_string()),
+    ];
     metrics::counter!("nubi_mcp_tool_calls_total", &labels).increment(1);
     metrics::histogram!(
         "nubi_mcp_tool_duration_seconds",
-        &[("tool", tool.to_string())]
+        &[("tool", safe_tool.to_string())]
     )
     .record(start.elapsed().as_secs_f64());
 }
 
+#[tracing::instrument(name = "mcp.http.request", skip_all, fields(http.method = "POST", http.route = "/mcp"))]
 async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: String) -> Response {
     let start = Instant::now();
-    let span = tracing::info_span!(
-        "mcp.http.request",
-        http.method = "POST",
-        http.route = "/mcp"
-    );
-    let _guard = span.enter();
 
     let token = headers
         .get(header::AUTHORIZATION)
@@ -2722,6 +2724,7 @@ fn init_telemetry() -> Option<PrometheusHandle> {
             .build();
 
         let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "nubi-mcp");
+        opentelemetry::global::set_tracer_provider(provider);
         let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
 
         registry.with(otel_layer).init();
