@@ -2616,7 +2616,7 @@ async fn handle_http_request(
     }
 }
 
-fn record_http_request(method: &str, route: &str, status: u16, start: Instant) {
+fn record_http_request(method: &str, route: &str, status: &str, start: Instant) {
     let labels = [
         ("method", method.to_string()),
         ("route", route.to_string()),
@@ -2639,12 +2639,16 @@ static KNOWN_TOOLS: LazyLock<HashSet<String>> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
-fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
-    let safe_tool = if KNOWN_TOOLS.contains(tool) {
-        tool
+fn tool_label(name: &str) -> &str {
+    if KNOWN_TOOLS.contains(name) {
+        name
     } else {
         "unknown"
-    };
+    }
+}
+
+fn record_tool_call(tool: &str, is_error: bool, start: Instant) {
+    let safe_tool = tool_label(tool);
     let status = if is_error { "error" } else { "ok" };
     let labels = [
         ("tool", safe_tool.to_string()),
@@ -2669,7 +2673,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
         .map(|t| t.trim().to_string());
 
     let Some(token) = token else {
-        record_http_request("POST", "/mcp", 401, start);
+        record_http_request("POST", "/mcp", "401", start);
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -2681,7 +2685,7 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
     let msg: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
-            record_http_request("POST", "/mcp", 400, start);
+            record_http_request("POST", "/mcp", "400", start);
             return axum::Json(rpc_err(Value::Null, -32700, format!("parse error: {}", e)))
                 .into_response();
         }
@@ -2689,14 +2693,14 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
 
     // Notifications and responses carry no id; acknowledge without a body.
     if msg.get("id").is_none_or(Value::is_null) {
-        record_http_request("POST", "/mcp", 202, start);
+        record_http_request("POST", "/mcp", "202", start);
         return StatusCode::ACCEPTED.into_response();
     }
 
     let req: JsonRpcRequest = match serde_json::from_value(msg) {
         Ok(r) => r,
         Err(e) => {
-            record_http_request("POST", "/mcp", 400, start);
+            record_http_request("POST", "/mcp", "400", start);
             return axum::Json(rpc_err(
                 Value::Null,
                 -32600,
@@ -2706,9 +2710,14 @@ async fn mcp_post(State(state): State<HttpState>, headers: HeaderMap, body: Stri
         }
     };
 
-    let response = axum::Json(handle_http_request(&state, &token, req).await).into_response();
-    record_http_request("POST", "/mcp", 200, start);
-    response
+    let response = handle_http_request(&state, &token, req).await;
+    let status = if response.error.is_some() {
+        "rpc_error"
+    } else {
+        "200"
+    };
+    record_http_request("POST", "/mcp", status, start);
+    axum::Json(response).into_response()
 }
 
 fn init_telemetry(json_logs: bool) -> Option<PrometheusHandle> {
@@ -2796,7 +2805,27 @@ async fn run_http(addr: SocketAddr, metrics_handle: Option<PrometheusHandle>) {
         base_url
     );
 
-    if let Err(e) = axum::serve(listener, app).await {
+    let shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        ctrl_c.await.ok();
+        tracing::info!("shutdown signal received");
+    };
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("server error: {}", e);
         std::process::exit(1);
     }
@@ -4767,8 +4796,8 @@ mod tests {
 
     #[test]
     fn record_http_request_does_not_panic() {
-        record_http_request("GET", "/mcp", 200, Instant::now());
-        record_http_request("POST", "/mcp", 401, Instant::now());
+        record_http_request("GET", "/mcp", "200", Instant::now());
+        record_http_request("POST", "/mcp", "401", Instant::now());
     }
 
     #[test]
@@ -4779,11 +4808,10 @@ mod tests {
 
     #[test]
     fn unknown_tool_maps_to_unknown_label() {
-        assert!(KNOWN_TOOLS.contains("nubi_send"));
-        assert!(KNOWN_TOOLS.contains("nubi_poll"));
-        assert!(!KNOWN_TOOLS.contains("nubi_bogus"));
-        assert!(!KNOWN_TOOLS.contains("evil_tool"));
+        assert_eq!(tool_label("nubi_send"), "nubi_send");
+        assert_eq!(tool_label("nubi_poll"), "nubi_poll");
+        assert_eq!(tool_label("nubi_bogus"), "unknown");
+        assert_eq!(tool_label("evil_tool"), "unknown");
         record_tool_call("nubi_bogus", false, Instant::now());
-        record_tool_call("evil_tool", false, Instant::now());
     }
 }
