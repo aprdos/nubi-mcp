@@ -87,9 +87,8 @@ impl Config {
 
 /// Mention ids arrive as the model typed them, so `@Manager ` and `manager`
 /// have to compare equal.
-fn same_agent(a: &str, b: &str) -> bool {
-    let norm = |s: &str| s.trim().trim_start_matches('@').to_lowercase();
-    norm(a) == norm(b)
+fn normalize_agent_name(s: &str) -> String {
+    s.trim().trim_start_matches('@').to_lowercase()
 }
 
 /// A name as the engine accepts it in `mentions`: no `@`,
@@ -355,7 +354,7 @@ async fn apply_mandate_update(
 ) -> Option<Value> {
     let agent = event["agent_id"].as_str();
     match (agent, me) {
-        (Some(agent), Some(me)) if !same_agent(agent, me) => return None,
+        (Some(agent), Some(me)) if normalize_agent_name(agent) != me => return None,
         (Some(_), None) => return None,
         _ => {}
     }
@@ -840,7 +839,7 @@ impl NubiClient {
             .request(reqwest::Method::GET, "/v1/me", None)
             .await
             .ok()?;
-        let id = me["agent_id"].as_str()?.to_string();
+        let id = normalize_agent_name(me["agent_id"].as_str()?);
         self.config.write().await.agent_id = Some(id.clone());
         Some(id)
     }
@@ -950,7 +949,7 @@ impl NubiClient {
         // turns handles into ids itself) and drop what can't be one. Naming
         // yourself asks nobody, so you go too, from cc as well.
         let me = self.self_id().await;
-        let not_me = |n: &String| me.as_deref().is_none_or(|me| !same_agent(n, me));
+        let not_me = |n: &String| me.as_deref().is_none_or(|me| n != me);
         let mut to: Vec<String> = Vec::new();
         for name in mentions
             .iter()
@@ -1286,10 +1285,10 @@ async fn spawn_subscription(
     let cfg = config.clone();
     let tx = notify_tx.clone();
     let mandate = mandate.clone();
-    let handle =
-        tokio::spawn(
-            async move { run_subscription(cfg, target, mentioned_only, tx, mandate).await },
-        );
+    let client = stream_client();
+    let handle = tokio::spawn(async move {
+        run_subscription(cfg, client, target, mentioned_only, tx, mandate).await
+    });
 
     subs.insert(key, handle);
     true
@@ -1300,12 +1299,12 @@ async fn spawn_subscription(
 /// on a fatal error; otherwise the caller aborts it via `nubi_unsubscribe`.
 async fn run_subscription(
     config: Arc<RwLock<Config>>,
+    client: reqwest::Client,
     target: Target,
     mentioned_only: bool,
     notify_tx: mpsc::UnboundedSender<Value>,
     mandate: Arc<Mutex<MandateState>>,
 ) {
-    let client = stream_client();
     let mut last_event_id: Option<String> = None;
     let mut delay_ms = RECONNECT_MIN_DELAY_MS;
 
@@ -3310,6 +3309,7 @@ mod tests {
 
         let task = tokio::spawn(run_subscription(
             config,
+            stream_client(),
             Target::Room("r1".into()),
             false,
             tx,
@@ -3352,7 +3352,15 @@ mod tests {
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        run_subscription(config, Target::Room("r1".into()), false, tx, Arc::default()).await;
+        run_subscription(
+            config,
+            stream_client(),
+            Target::Room("r1".into()),
+            false,
+            tx,
+            Arc::default(),
+        )
+        .await;
 
         let note = rx.recv().await.expect("failure notification");
         assert_eq!(note["params"]["meta"]["event"], "subscription_failed");
