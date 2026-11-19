@@ -886,7 +886,7 @@ impl NubiClient {
     async fn create_steps(
         &self,
         name: &str,
-        parent_room_id: &str,
+        parent_room_id: Option<&str>,
         steps: &Value,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
@@ -1776,12 +1776,12 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_steps",
-                "description": "Create a workflow: steps with assignees and dependencies, tracked from the thread the work happens in. Its parent must be a thread in a group or task room (not a channel itself, not a DM): start a thread on the message the work is about with nubi_create_thread first. Work, discussion, and evidence all happen inside the Steps room; each assignee is told in the Steps room when their step starts, and completes it with nubi_complete_step. Every assignee must be able to post in the thread. One workflow per piece of work: if one is already running for it (a PR, a task), continue or update that one instead of creating another for each commit or review round. Returns a `url` field — always share it so people can track progress directly.",
+                "description": "Create a workflow: steps with assignees and dependencies. When `parent_room_id` is provided, the workflow is tracked from that thread (must be a thread in a group or task room). When omitted, the workflow is standalone — all work, notices, and evidence live in the Steps room itself. Each assignee is told when their step starts, and completes it with nubi_complete_step. One workflow per piece of work: if one is already running for it (a PR, a task), continue or update that one instead of creating another for each commit or review round. Returns a `url` field — always share it so people can track progress directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The workflow's name" },
-                        "parent_room_id": { "type": "string", "description": "The thread the work happens in (`thread.{room}.{index}`), in a group or task room." },
+                        "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. When omitted, the Steps room is standalone." },
                         "steps": {
                             "type": "array",
                             "description": "Array of step definitions forming a DAG",
@@ -1808,7 +1808,7 @@ fn tools_list_full() -> Value {
                             }
                         }
                     },
-                    "required": ["name", "parent_room_id", "steps"]
+                    "required": ["name", "steps"]
                 }
             },
             {
@@ -2072,9 +2072,7 @@ async fn handle_tool_call(
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let parent = args["parent_room_id"]
-                .as_str()
-                .ok_or("parent_room_id required: the room the work happens in")?;
+            let parent = args.get("parent_room_id").and_then(|v| v.as_str());
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             client
                 .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
@@ -2956,12 +2954,16 @@ async fn main() {
     opentelemetry::global::shutdown_tracer_provider();
 }
 
-/// The body that creates a workflow tracked from `parent_room_id`.
-fn create_steps_body(name: &str, parent_room_id: &str, steps: &Value) -> Value {
+/// The body that creates a workflow, optionally tracked from `parent_room_id`.
+fn create_steps_body(name: &str, parent_room_id: Option<&str>, steps: &Value) -> Value {
+    let mut steps_inner = json!({ "steps": steps });
+    if let Some(parent) = parent_room_id {
+        steps_inner["parent_room"] = json!(parent);
+    }
     json!({
         "name": name,
         "room_type": "steps",
-        "steps": { "parent_room": parent_room_id, "steps": steps }
+        "steps": steps_inner
     })
 }
 
@@ -3116,11 +3118,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_workflow_is_created_from_its_parent_room() {
+    fn a_tracked_workflow_includes_parent_room() {
         let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
-        let body = create_steps_body("Ship", "work-1", &steps);
+        let body = create_steps_body("Ship", Some("work-1"), &steps);
         assert_eq!(body["room_type"], "steps");
         assert_eq!(body["steps"]["parent_room"], "work-1");
+        assert_eq!(body["steps"]["steps"], steps);
+    }
+
+    #[test]
+    fn a_standalone_workflow_omits_parent_room() {
+        let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
+        let body = create_steps_body("Ship", None, &steps);
+        assert_eq!(body["room_type"], "steps");
+        assert!(body["steps"]["parent_room"].is_null());
         assert_eq!(body["steps"]["steps"], steps);
     }
 
@@ -3161,10 +3172,10 @@ mod tests {
         let tools = tools["tools"].as_array().unwrap();
         let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
         let create = find("nubi_create_steps");
-        assert!(create["inputSchema"]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("parent_room_id")));
+        let required = create["inputSchema"]["required"].as_array().unwrap();
+        assert!(required.contains(&json!("name")));
+        assert!(required.contains(&json!("steps")));
+        assert!(!required.contains(&json!("parent_room_id")));
         let complete = find("nubi_complete_step");
         assert_eq!(
             complete["inputSchema"]["required"],
