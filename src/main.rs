@@ -2741,10 +2741,25 @@ fn init_telemetry(json_logs: bool) -> Option<PrometheusHandle> {
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+        let exporter = match opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .build()
-            .expect("failed to create OTLP span exporter");
+        {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "[nubi-mcp] OTel span exporter failed to initialize, tracing disabled: {e}"
+                );
+                registry.init();
+                return if json_logs {
+                    metrics_exporter_prometheus::PrometheusBuilder::new()
+                        .install_recorder()
+                        .ok()
+                } else {
+                    None
+                };
+            }
+        };
 
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
             .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
@@ -2938,6 +2953,7 @@ async fn main() {
     }
 
     stdout_handle.abort();
+    opentelemetry::global::shutdown_tracer_provider();
 }
 
 /// The body that creates a workflow tracked from `parent_room_id`.
