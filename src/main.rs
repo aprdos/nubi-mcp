@@ -2072,10 +2072,7 @@ async fn handle_tool_call(
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let parent = args
-                .get("parent_room_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.trim().is_empty());
+            let parent = parent_room_arg(args);
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             client
                 .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
@@ -2957,6 +2954,12 @@ async fn main() {
     opentelemetry::global::shutdown_tracer_provider();
 }
 
+fn parent_room_arg(args: &Value) -> Option<&str> {
+    args.get("parent_room_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// The body that creates a workflow, optionally tracked from `parent_room_id`.
 fn create_steps_body(name: &str, parent_room_id: Option<&str>, steps: &Value) -> Value {
     let mut steps_inner = json!({ "steps": steps });
@@ -3140,26 +3143,14 @@ mod tests {
 
     #[test]
     fn empty_parent_room_id_is_treated_as_standalone() {
-        let args = json!({ "parent_room_id": "" });
-        let parent = args
-            .get("parent_room_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
-        assert!(parent.is_none());
-
-        let args = json!({ "parent_room_id": "  " });
-        let parent = args
-            .get("parent_room_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
-        assert!(parent.is_none());
-
-        let args = json!({});
-        let parent = args
-            .get("parent_room_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty());
-        assert!(parent.is_none());
+        assert!(parent_room_arg(&json!({ "parent_room_id": "" })).is_none());
+        assert!(parent_room_arg(&json!({ "parent_room_id": "  " })).is_none());
+        assert!(parent_room_arg(&json!({})).is_none());
+        assert!(parent_room_arg(&json!({ "parent_room_id": null })).is_none());
+        assert_eq!(
+            parent_room_arg(&json!({ "parent_room_id": "thread.r.1" })),
+            Some("thread.r.1")
+        );
     }
 
     #[test]
