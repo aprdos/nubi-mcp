@@ -2072,7 +2072,10 @@ async fn handle_tool_call(
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            let parent = args.get("parent_room_id").and_then(|v| v.as_str());
+            let parent = args
+                .get("parent_room_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty());
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             client
                 .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
@@ -3133,6 +3136,30 @@ mod tests {
         assert_eq!(body["room_type"], "steps");
         assert!(body["steps"]["parent_room"].is_null());
         assert_eq!(body["steps"]["steps"], steps);
+    }
+
+    #[test]
+    fn empty_parent_room_id_is_treated_as_standalone() {
+        let args = json!({ "parent_room_id": "" });
+        let parent = args
+            .get("parent_room_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        assert!(parent.is_none());
+
+        let args = json!({ "parent_room_id": "  " });
+        let parent = args
+            .get("parent_room_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        assert!(parent.is_none());
+
+        let args = json!({});
+        let parent = args
+            .get("parent_room_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        assert!(parent.is_none());
     }
 
     #[test]
