@@ -31,24 +31,29 @@ jobs:
     steps:
       # A run still waiting for a runner when a newer push lands is not always
       # cancelled by `concurrency`; once it gets one, it stops itself instead of
-      # testing a commit that is no longer the tip. The token goes through the
-      # environment and stdin, never a command line.
+      # testing a commit that is no longer the tip of its branch. It reads the
+      # branch itself, which moves with the push: a pull request's own ref
+      # (refs/pull/N/head) can lag behind and make the newest run look stale.
+      # The token goes through the environment and stdin, never a command line,
+      # and its base64 form is masked in the log.
       - name: Stop if a newer commit superseded this one
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
           TOKEN: ${{ github.token }}
-          REF: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.ref }}
+          REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
           MINE: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          CANCEL_URL: ${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel
         run: |
           auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
           # Actions masks the token, not values made from it
           echo "::add-mask::$auth"
           tip=$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
-            git ls-remote "${{ github.server_url }}/${{ github.repository }}.git" "$REF" | awk -v ref="$REF" '$2 == ref { print $1; exit }') || true
+            git ls-remote "$REPO_URL" "$REF" | awk -v ref="$REF" '$2 == ref { print $1; exit }') || true
           [ -n "$tip" ] || echo "Could not read the tip of $REF; carrying on."
           if [ -n "$tip" ] && [ "$tip" != "$MINE" ]; then
             echo "Superseded by $tip; cancelling this run."
-            if printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - -X POST -H "Accept: application/vnd.github+json" \
-              "${{ github.api_url }}/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/cancel" > /dev/null; then
+            if printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - -X POST -H "Accept: application/vnd.github+json" "$CANCEL_URL" > /dev/null; then
               sleep 300
               echo "Still running five minutes after cancelling; failing rather than testing a stale commit."
               exit 1
