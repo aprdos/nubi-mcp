@@ -40,8 +40,9 @@ jobs:
           MINE: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 | tr -d '\n')
-          tip=$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: basic $auth" \
+          tip=$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: Basic $auth" \
             git ls-remote "${{ github.server_url }}/${{ github.repository }}.git" "$REF" | awk -v ref="$REF" '$2 == ref { print $1; exit }') || true
+          [ -n "$tip" ] || echo "Could not read the tip of $REF; carrying on."
           if [ -n "$tip" ] && [ "$tip" != "$MINE" ]; then
             echo "Superseded by $tip; cancelling this run."
             if printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -fsS -K - -X POST -H "Accept: application/vnd.github+json" \
