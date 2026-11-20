@@ -896,6 +896,27 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
+    async fn search_collections(&self, query: &str) -> Result<Value, String> {
+        let all = self.list_collections().await?;
+        let query_lower = query.to_lowercase();
+        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let filtered: Vec<Value> = all
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter(|c| {
+                let name = c["name"].as_str().unwrap_or("").to_lowercase();
+                let desc = c["description"].as_str().unwrap_or("").to_lowercase();
+                let combined = format!("{} {}", name, desc);
+                query_words.iter().all(|w| combined.contains(w))
+            })
+            .cloned()
+            .collect();
+
+        Ok(Value::Array(filtered))
+    }
+
     async fn create_collection(
         &self,
         name: &str,
@@ -1782,10 +1803,21 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_list_collections",
-                "description": "List doc collections (shelves) in the space. Collections organize docs by topic or project.",
+                "description": "List doc collections (shelves) in the space. Collections organize docs by topic or project. Returns id, name, description, position, created_by and created_at_ms for each collection — use name and description to decide where to file a new doc.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
+                }
+            },
+            {
+                "name": "nubi_search_collections",
+                "description": "Search doc collections by name or description. Fuzzy match: all query words must appear somewhere in the collection's name or description. Use this to find where to file a doc when you know part of the topic.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Words to match against collection name and description" }
+                    },
+                    "required": ["query"]
                 }
             },
             {
@@ -2134,6 +2166,10 @@ async fn handle_tool_call(
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
         "nubi_list_collections" => client.list_collections().await,
+        "nubi_search_collections" => {
+            let query = args["query"].as_str().ok_or("query required")?;
+            client.search_collections(query).await
+        }
         "nubi_create_collection" => {
             let name = args["name"].as_str().ok_or("name required")?;
             client
@@ -4136,6 +4172,7 @@ mod tests {
                 "nubi_detach_skill_set",
                 "nubi_list_docs",
                 "nubi_list_collections",
+                "nubi_search_collections",
                 "nubi_create_collection",
                 "nubi_get_doc",
                 "nubi_create_doc",
