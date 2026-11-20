@@ -901,6 +901,10 @@ impl NubiClient {
         let query_lower = query.to_lowercase();
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
 
+        if query_words.is_empty() {
+            return Err("query must contain at least one word".to_string());
+        }
+
         let filtered: Vec<Value> = all
             .as_array()
             .unwrap_or(&vec![])
@@ -908,8 +912,9 @@ impl NubiClient {
             .filter(|c| {
                 let name = c["name"].as_str().unwrap_or("").to_lowercase();
                 let desc = c["description"].as_str().unwrap_or("").to_lowercase();
-                let combined = format!("{} {}", name, desc);
-                query_words.iter().all(|w| combined.contains(w))
+                query_words
+                    .iter()
+                    .all(|w| name.contains(w) || desc.contains(w))
             })
             .cloned()
             .collect();
