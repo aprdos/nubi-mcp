@@ -2146,13 +2146,25 @@ async fn handle_tool_call(
         }
         "nubi_create_doc" => {
             let name = args["name"].as_str().ok_or("name required")?;
+            let collection_id = args["collection_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty());
+            let parent_doc_id = args["parent_doc_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty());
+            if collection_id.is_none() && parent_doc_id.is_none() {
+                return Err(
+                    "collection_id or parent_doc_id required: provide one to place the doc"
+                        .to_string(),
+                );
+            }
             client
                 .create_doc(
                     name,
                     args["content"].as_str(),
                     args["description"].as_str(),
-                    args["collection_id"].as_str(),
-                    args["parent_doc_id"].as_str(),
+                    collection_id,
+                    parent_doc_id,
                 )
                 .await
         }
