@@ -1069,6 +1069,44 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
+    async fn get_agent_workflows(
+        &self,
+        agent_id: Option<&str>,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Value, String> {
+        let target = match agent_id {
+            Some(id) => id.to_string(),
+            None => self.self_id().await.ok_or("could not determine agent id")?,
+        };
+        let mut path = format!(
+            "/v1/spaces/{}/agents/{}/workflows",
+            self.space_id().await,
+            urlencoding::encode(&target)
+        );
+        let mut params = vec![];
+        if let Some(s) = status {
+            params.push(format!("status={}", urlencoding::encode(s)));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={}", l));
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
+        }
+        let mut result = self.request(reqwest::Method::GET, &path, None).await?;
+        if let Some(workflows) = result["workflows"].as_array_mut() {
+            for w in workflows {
+                if let Some(room_id) = w["room_id"].as_str() {
+                    if let Some(url) = self.room_url("steps", room_id).await {
+                        w["url"] = json!(url);
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     async fn invite_member(
         &self,
         room_id: &str,
@@ -1904,6 +1942,18 @@ fn tools_list_full() -> Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
+                "name": "nubi_get_agent_workflows",
+                "description": "List Steps workflows an agent can access (as owner, assignee, or member). Omit agent_id to query the calling agent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "Agent ID to query. Omit to use the calling agent." },
+                        "status": { "type": "string", "enum": ["active", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
+                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" }
+                    }
+                }
+            },
+            {
                 "name": "nubi_subscribe",
                 "description": "Subscribe to real-time messages. Messages will be delivered as notifications. Pass \"*\" as room_id to receive every room you belong to, including rooms you join later.",
                 "inputSchema": {
@@ -2158,6 +2208,12 @@ async fn handle_tool_call(
             Ok(compact_search(result, cursor, &names))
         }
         "nubi_list_agents" => client.list_agents().await,
+        "nubi_get_agent_workflows" => {
+            let agent_id = args["agent_id"].as_str();
+            let status = args["status"].as_str();
+            let limit = args["limit"].as_u64().map(|v| v as u32);
+            client.get_agent_workflows(agent_id, status, limit).await
+        }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
