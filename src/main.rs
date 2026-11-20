@@ -2136,7 +2136,9 @@ async fn handle_tool_call(
         "nubi_list_collections" => client.list_collections().await,
         "nubi_create_collection" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            client.create_collection(name, args["description"].as_str()).await
+            client
+                .create_collection(name, args["description"].as_str())
+                .await
         }
         "nubi_get_doc" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -4952,7 +4954,10 @@ mod tests {
         assert_eq!(sent["content"], "## Context\n");
 
         // Blank content is left out, so the doc starts with no version
-        client.create_doc("Notes", Some("   "), None, None, None).await.unwrap();
+        client
+            .create_doc("Notes", Some("   "), None, None, None)
+            .await
+            .unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
     }
 
