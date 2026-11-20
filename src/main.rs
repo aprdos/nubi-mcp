@@ -707,6 +707,8 @@ impl NubiClient {
         name: &str,
         content: Option<&str>,
         description: Option<&str>,
+        collection_id: Option<&str>,
+        parent_doc_id: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let mut body = json!({ "name": name, "room_type": "doc" });
@@ -715,6 +717,12 @@ impl NubiClient {
         }
         if let Some(d) = description.filter(|d| !d.trim().is_empty()) {
             body["description"] = json!(d);
+        }
+        if let Some(cid) = collection_id.filter(|s| !s.trim().is_empty()) {
+            body["collection_id"] = json!(cid);
+        }
+        if let Some(pid) = parent_doc_id.filter(|s| !s.trim().is_empty()) {
+            body["parent_doc_id"] = json!(pid);
         }
         let meta = self
             .request(reqwest::Method::POST, &path, Some(body))
@@ -880,6 +888,24 @@ impl NubiClient {
     async fn create_room(&self, name: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let body = json!({ "name": name });
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn list_collections(&self) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/doc-collections", self.space_id().await);
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    async fn create_collection(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/doc-collections", self.space_id().await);
+        let mut body = json!({ "name": name });
+        if let Some(d) = description.filter(|d| !d.trim().is_empty()) {
+            body["description"] = json!(d);
+        }
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
@@ -1755,6 +1781,26 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_list_collections",
+                "description": "List doc collections (shelves) in the space. Collections organize docs by topic or project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "nubi_create_collection",
+                "description": "Create a doc collection (shelf) to organize docs by topic or project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The collection's name" },
+                        "description": { "type": "string", "description": "One line on what docs belong here (optional)" }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
                 "name": "nubi_get_doc",
                 "description": "Read a doc as Markdown, with its review status and version. Use an approved doc as the source of truth for what to build. Returns base_version, which nubi_update_doc needs. Discussion about the doc happens in its room (nubi_poll, nubi_send).",
                 "inputSchema": {
@@ -1774,7 +1820,9 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "name": { "type": "string", "description": "The doc's title" },
                         "content": { "type": "string", "description": "The doc as Markdown: headings, lists, checklists, tables, quotes, code and links" },
-                        "description": { "type": "string", "description": "One line on what the doc covers (optional)" }
+                        "description": { "type": "string", "description": "One line on what the doc covers (optional)" },
+                        "collection_id": { "type": "string", "description": "Collection to file the doc in (required if parent_doc_id not set)" },
+                        "parent_doc_id": { "type": "string", "description": "Parent doc in the page tree (required if collection_id not set)" }
                     },
                     "required": ["name"]
                 }
@@ -2085,6 +2133,11 @@ async fn handle_tool_call(
             client.detach_skill_set(set_id, agent_id).await
         }
         "nubi_list_docs" => client.list_docs(args["status"].as_str()).await,
+        "nubi_list_collections" => client.list_collections().await,
+        "nubi_create_collection" => {
+            let name = args["name"].as_str().ok_or("name required")?;
+            client.create_collection(name, args["description"].as_str()).await
+        }
         "nubi_get_doc" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_doc(room_id, args["version"].as_u64()).await
@@ -2092,7 +2145,13 @@ async fn handle_tool_call(
         "nubi_create_doc" => {
             let name = args["name"].as_str().ok_or("name required")?;
             client
-                .create_doc(name, args["content"].as_str(), args["description"].as_str())
+                .create_doc(
+                    name,
+                    args["content"].as_str(),
+                    args["description"].as_str(),
+                    args["collection_id"].as_str(),
+                    args["parent_doc_id"].as_str(),
+                )
                 .await
         }
         "nubi_update_doc" => {
@@ -4062,6 +4121,8 @@ mod tests {
                 "nubi_attach_skill_set",
                 "nubi_detach_skill_set",
                 "nubi_list_docs",
+                "nubi_list_collections",
+                "nubi_create_collection",
                 "nubi_get_doc",
                 "nubi_create_doc",
                 "nubi_update_doc",
@@ -4877,7 +4938,7 @@ mod tests {
     async fn create_doc_sends_the_first_version() {
         let (client, state) = spawn_doc_engine(two_versions()).await;
         let created = client
-            .create_doc("Rollout", Some("## Context\n"), None)
+            .create_doc("Rollout", Some("## Context\n"), None, None, None)
             .await
             .unwrap();
         assert_eq!(created["room_id"], "new-doc");
@@ -4891,7 +4952,7 @@ mod tests {
         assert_eq!(sent["content"], "## Context\n");
 
         // Blank content is left out, so the doc starts with no version
-        client.create_doc("Notes", Some("   "), None).await.unwrap();
+        client.create_doc("Notes", Some("   "), None, None, None).await.unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
     }
 
