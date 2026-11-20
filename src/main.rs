@@ -2211,7 +2211,7 @@ async fn handle_tool_call(
         "nubi_get_agent_workflows" => {
             let agent_id = args["agent_id"].as_str();
             let status = args["status"].as_str();
-            let limit = args["limit"].as_u64().map(|v| v as u32);
+            let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
             client.get_agent_workflows(agent_id, status, limit).await
         }
         "nubi_invite" => {
