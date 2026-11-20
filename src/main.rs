@@ -954,7 +954,9 @@ impl NubiClient {
             .filter(|c| {
                 let name = c["name"].as_str().unwrap_or("").to_lowercase();
                 let desc = c["description"].as_str().unwrap_or("").to_lowercase();
-                query_words.iter().all(|w| name.contains(w) || desc.contains(w))
+                query_words
+                    .iter()
+                    .all(|w| name.contains(w) || desc.contains(w))
             })
             .cloned()
             .collect();
@@ -2293,7 +2295,12 @@ async fn handle_tool_call(
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             let requested_by = args["requested_by"].as_str();
             client
-                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()), requested_by)
+                .create_steps(
+                    name,
+                    parent,
+                    &serde_json::Value::Array(steps.clone()),
+                    requested_by,
+                )
                 .await
         }
         "nubi_complete_step" => {
