@@ -5048,7 +5048,7 @@ mod tests {
     async fn create_doc_sends_the_first_version() {
         let (client, state) = spawn_doc_engine(two_versions()).await;
         let created = client
-            .create_doc("Rollout", Some("## Context\n"), None, None, None)
+            .create_doc("Rollout", Some("## Context\n"), None, None, None, None)
             .await
             .unwrap();
         assert_eq!(created["room_id"], "new-doc");
@@ -5063,7 +5063,7 @@ mod tests {
 
         // Blank content is left out, so the doc starts with no version
         client
-            .create_doc("Notes", Some("   "), None, None, None)
+            .create_doc("Notes", Some("   "), None, None, None, None)
             .await
             .unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
@@ -5088,5 +5088,32 @@ mod tests {
         assert_eq!(tool_label("nubi_bogus"), "unknown");
         assert_eq!(tool_label("evil_tool"), "unknown");
         record_tool_call("nubi_bogus", false, Instant::now());
+    }
+
+    #[test]
+    fn creation_tools_expose_optional_requested_by() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
+
+        for tool_name in [
+            "nubi_create_room",
+            "nubi_create_doc",
+            "nubi_create_skill_set",
+            "nubi_create_steps",
+        ] {
+            let tool = find(tool_name);
+            let schema = &tool["inputSchema"];
+            let props = schema["properties"].as_object().unwrap();
+            assert!(
+                props.contains_key("requested_by"),
+                "{tool_name} should have requested_by param"
+            );
+            let required = schema["required"].as_array().unwrap();
+            assert!(
+                !required.contains(&json!("requested_by")),
+                "{tool_name}: requested_by should be optional"
+            );
+        }
     }
 }
