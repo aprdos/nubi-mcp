@@ -1322,6 +1322,50 @@ impl NubiClient {
         self.request(reqwest::Method::POST, &path, Some(body)).await
     }
 
+    async fn append_memory(
+        &self,
+        text: &str,
+        priority: Option<i32>,
+        category: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!("/v1/spaces/{}/memory", self.space_id().await);
+        let mut body = json!({ "text": text });
+        if let Some(p) = priority {
+            body["priority"] = json!(p);
+        }
+        if let Some(c) = category {
+            body["category"] = json!(c);
+        }
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn query_memory(
+        &self,
+        category: Option<&str>,
+        max_priority: Option<i32>,
+        limit: Option<u32>,
+        from_index: Option<u64>,
+    ) -> Result<Value, String> {
+        let mut path = format!("/v1/spaces/{}/memory", self.space_id().await);
+        let mut params = Vec::new();
+        if let Some(c) = category {
+            params.push(format!("category={}", urlencoding::encode(c)));
+        }
+        if let Some(p) = max_priority {
+            params.push(format!("max_priority={}", p));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={}", l));
+        }
+        if let Some(f) = from_index {
+            params.push(format!("from_index={}", f));
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
     async fn reload_token(&self) -> Result<(), String> {
         let mut config = self.config.write().await;
         config.reload_token()
@@ -2235,6 +2279,32 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_append_memory",
+                "description": "Append an entry to the space's shared memory. Memory is append-only: entries cannot be edited or deleted. Use priority to rank importance (lower = more important, default 2). Use category to tag entries for filtering.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "The memory text (required, max 10,000 chars)" },
+                        "priority": { "type": "integer", "description": "Priority level (lower = more important). Default: 2. Use 0-1 for critical facts, 2 for normal, 3+ for low priority." },
+                        "category": { "type": "string", "description": "Optional category tag for filtering (max 100 chars)" }
+                    },
+                    "required": ["text"]
+                }
+            },
+            {
+                "name": "nubi_query_memory",
+                "description": "Query entries from the space's shared memory. Returns entries in ascending index order. Use filters to narrow results. Use from_index + limit for pagination.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "category": { "type": "string", "description": "Filter by category tag" },
+                        "max_priority": { "type": "integer", "description": "Filter to entries with priority <= this value" },
+                        "limit": { "type": "integer", "description": "Max entries to return (default 50, max 100)" },
+                        "from_index": { "type": "integer", "description": "Start from this index for pagination" }
+                    }
+                }
+            },
+            {
                 "name": "nubi_reload",
                 "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -2508,6 +2578,19 @@ async fn handle_tool_call(
             client
                 .update_steps(room_id, add_steps, update_steps, remove_steps)
                 .await
+        }
+        "nubi_append_memory" => {
+            let text = args["text"].as_str().ok_or("text required")?;
+            let priority = args["priority"].as_i64().map(|p| p as i32);
+            let category = args["category"].as_str();
+            client.append_memory(text, priority, category).await
+        }
+        "nubi_query_memory" => {
+            let category = args["category"].as_str();
+            let max_priority = args["max_priority"].as_i64().map(|p| p as i32);
+            let limit = args["limit"].as_u64().map(|l| l as u32);
+            let from_index = args["from_index"].as_u64();
+            client.query_memory(category, max_priority, limit, from_index).await
         }
         "nubi_reload" => {
             client.reload_token().await?;
