@@ -938,9 +938,10 @@ impl NubiClient {
         name: &str,
         parent_room_id: Option<&str>,
         steps: &Value,
+        is_template: bool,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
-        let body = create_steps_body(name, parent_room_id, steps);
+        let body = create_steps_body(name, parent_room_id, steps, is_template);
         let meta = self
             .request(reqwest::Method::POST, &path, Some(body))
             .await?;
@@ -950,6 +951,9 @@ impl NubiClient {
             "name": meta["name"],
             "steps": meta["kind"]["steps"],
         });
+        if is_template {
+            result["is_template"] = json!(true);
+        }
         if let Some(url) = self.room_url("steps", room_id).await {
             result["url"] = json!(url);
         }
@@ -1124,6 +1128,7 @@ impl NubiClient {
         agent_id: Option<&str>,
         status: Option<&str>,
         limit: Option<u32>,
+        is_template: Option<&str>,
     ) -> Result<Value, String> {
         let target = match agent_id {
             Some(id) => id.to_string(),
@@ -1141,6 +1146,9 @@ impl NubiClient {
         if let Some(l) = limit {
             params.push(format!("limit={}", l));
         }
+        if let Some(t) = is_template {
+            params.push(format!("is_template={}", urlencoding::encode(t)));
+        }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
         }
@@ -1155,6 +1163,60 @@ impl NubiClient {
             }
         }
         Ok(result)
+    }
+
+    async fn promote_template(
+        &self,
+        room_id: &str,
+        name: Option<&str>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/promote",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let body = match name {
+            Some(n) => json!({ "name": n }),
+            None => json!({}),
+        };
+        let meta = self
+            .request(reqwest::Method::POST, &path, Some(body))
+            .await?;
+        let new_room_id = meta["id"].as_str().unwrap_or_default();
+        let mut result = json!({
+            "room_id": new_room_id,
+            "name": meta["name"],
+            "steps": meta["kind"]["steps"],
+        });
+        if let Some(url) = self.room_url("steps", new_room_id).await {
+            result["url"] = json!(url);
+        }
+        Ok(result)
+    }
+
+    async fn update_steps(
+        &self,
+        room_id: &str,
+        add_steps: Option<&Value>,
+        update_steps: Option<&Value>,
+        remove_steps: Option<&Value>,
+    ) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/steps",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let mut body = json!({});
+        if let Some(add) = add_steps {
+            body["add_steps"] = add.clone();
+        }
+        if let Some(update) = update_steps {
+            body["update_steps"] = update.clone();
+        }
+        if let Some(remove) = remove_steps {
+            body["remove_steps"] = remove.clone();
+        }
+        self.request(reqwest::Method::PATCH, &path, Some(body)).await
     }
 
     async fn invite_member(
@@ -1903,6 +1965,7 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "name": { "type": "string", "description": "The workflow's name" },
                         "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. When omitted, the Steps room is standalone." },
+                        "is_template": { "type": "boolean", "description": "If true, creates a workflow template that cannot execute until promoted. Templates stay in `pending` status and are excluded from workflow history by default." },
                         "steps": {
                             "type": "array",
                             "description": "Array of step definitions forming a DAG",
@@ -2031,8 +2094,9 @@ fn tools_list_full() -> Value {
                     "type": "object",
                     "properties": {
                         "agent_id": { "type": "string", "description": "Agent ID to query. Omit to use the calling agent." },
-                        "status": { "type": "string", "enum": ["active", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
-                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" }
+                        "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
+                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" },
+                        "is_template": { "type": "string", "enum": ["true", "false", "all"], "description": "Filter by template status: true = only templates, false = only actual workflows, all = both. Default: exclude templates." }
                     }
                 }
             },
@@ -2108,6 +2172,64 @@ fn tools_list_full() -> Value {
                         "reason": { "type": "string", "description": "Optional reason for skipping" }
                     },
                     "required": ["room_id", "step_id"]
+                }
+            },
+            {
+                "name": "nubi_promote_workflow",
+                "description": "Promote a workflow template to an actual workflow. Clones the template with `is_template: false`, starts root steps, and kicks off assignees. Returns the new workflow room.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The template Steps room id to promote" },
+                        "name": { "type": "string", "description": "Optional custom name for the promoted workflow. Defaults to the template's name." }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_update_steps",
+                "description": "Update workflow steps. Allows adding, modifying, or removing steps in a workflow (template or actual). Respects the workflow's edit_policy.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Steps room id" },
+                        "add_steps": {
+                            "type": "array",
+                            "description": "New steps to add to the workflow",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "Unique step ID" },
+                                    "assignees": { "type": "array", "items": { "type": "string" }, "description": "Agent IDs assigned to this step" },
+                                    "description": { "type": "string" },
+                                    "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Step IDs this step depends on" },
+                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" },
+                                    "verifier": { "type": "string", "enum": ["none", "default"] },
+                                    "completion_mode": { "type": "string", "enum": ["any", "all"] }
+                                },
+                                "required": ["id", "assignees", "description"]
+                            }
+                        },
+                        "update_steps": {
+                            "type": "array",
+                            "description": "Steps to modify (by id). Only description and assignees can be changed.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string", "description": "The step ID to update" },
+                                    "description": { "type": "string", "description": "New description (optional)" },
+                                    "assignees": { "type": "array", "items": { "type": "string" }, "description": "New assignees (optional)" }
+                                },
+                                "required": ["id"]
+                            }
+                        },
+                        "remove_steps": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Step IDs to remove. Only pending steps that haven't started can be removed."
+                        }
+                    },
+                    "required": ["room_id"]
                 }
             },
             {
@@ -2236,8 +2358,9 @@ async fn handle_tool_call(
             let name = args["name"].as_str().ok_or("name required")?;
             let parent = parent_room_arg(args);
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
+            let is_template = args["is_template"].as_bool().unwrap_or(false);
             client
-                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
+                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()), is_template)
                 .await
         }
         "nubi_complete_step" => {
@@ -2324,7 +2447,8 @@ async fn handle_tool_call(
             let agent_id = args["agent_id"].as_str();
             let status = args["status"].as_str();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
-            client.get_agent_workflows(agent_id, status, limit).await
+            let is_template = args["is_template"].as_str();
+            client.get_agent_workflows(agent_id, status, limit, is_template).await
         }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2355,6 +2479,18 @@ async fn handle_tool_call(
             let step_id = args["step_id"].as_str().ok_or("step_id required")?;
             let reason = args["reason"].as_str();
             client.skip_step(room_id, step_id, reason).await
+        }
+        "nubi_promote_workflow" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let name = args["name"].as_str();
+            client.promote_template(room_id, name).await
+        }
+        "nubi_update_steps" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let add_steps = args.get("add_steps").filter(|v| !v.is_null());
+            let update_steps = args.get("update_steps").filter(|v| !v.is_null());
+            let remove_steps = args.get("remove_steps").filter(|v| !v.is_null());
+            client.update_steps(room_id, add_steps, update_steps, remove_steps).await
         }
         "nubi_reload" => {
             client.reload_token().await?;
@@ -3129,10 +3265,13 @@ fn parent_room_arg(args: &Value) -> Option<&str> {
 }
 
 /// The body that creates a workflow, optionally tracked from `parent_room_id`.
-fn create_steps_body(name: &str, parent_room_id: Option<&str>, steps: &Value) -> Value {
+fn create_steps_body(name: &str, parent_room_id: Option<&str>, steps: &Value, is_template: bool) -> Value {
     let mut steps_inner = json!({ "steps": steps });
     if let Some(parent) = parent_room_id {
         steps_inner["parent_room"] = json!(parent);
+    }
+    if is_template {
+        steps_inner["is_template"] = json!(true);
     }
     json!({
         "name": name,
@@ -3294,18 +3433,28 @@ mod tests {
     #[test]
     fn a_tracked_workflow_includes_parent_room() {
         let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
-        let body = create_steps_body("Ship", Some("work-1"), &steps);
+        let body = create_steps_body("Ship", Some("work-1"), &steps, false);
         assert_eq!(body["room_type"], "steps");
         assert_eq!(body["steps"]["parent_room"], "work-1");
         assert_eq!(body["steps"]["steps"], steps);
+        assert!(body["steps"]["is_template"].is_null());
     }
 
     #[test]
     fn a_standalone_workflow_omits_parent_room() {
         let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
-        let body = create_steps_body("Ship", None, &steps);
+        let body = create_steps_body("Ship", None, &steps, false);
         assert_eq!(body["room_type"], "steps");
         assert!(body["steps"]["parent_room"].is_null());
+        assert_eq!(body["steps"]["steps"], steps);
+    }
+
+    #[test]
+    fn a_template_workflow_includes_is_template() {
+        let steps = json!([{ "id": "a", "assignees": ["ada"], "description": "Design" }]);
+        let body = create_steps_body("Template", None, &steps, true);
+        assert_eq!(body["room_type"], "steps");
+        assert_eq!(body["steps"]["is_template"], true);
         assert_eq!(body["steps"]["steps"], steps);
     }
 
@@ -3362,11 +3511,16 @@ mod tests {
         assert!(required.contains(&json!("name")));
         assert!(required.contains(&json!("steps")));
         assert!(!required.contains(&json!("parent_room_id")));
+        assert!(!required.contains(&json!("is_template")));
         let complete = find("nubi_complete_step");
         assert_eq!(
             complete["inputSchema"]["required"],
             json!(["room_id", "step_id", "evidence"])
         );
+        let promote = find("nubi_promote_workflow");
+        assert_eq!(promote["inputSchema"]["required"], json!(["room_id"]));
+        let update = find("nubi_update_steps");
+        assert_eq!(update["inputSchema"]["required"], json!(["room_id"]));
     }
 
     #[test]
