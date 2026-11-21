@@ -1205,14 +1205,14 @@ impl NubiClient {
             urlencoding::encode(room_id)
         );
         let mut body = json!({});
-        if let Some(add) = add_steps.filter(|v| v.as_array().map_or(true, |a| !a.is_empty())) {
+        if let Some(add) = add_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty())) {
             body["add_steps"] = add.clone();
         }
-        if let Some(update) = update_steps.filter(|v| v.as_array().map_or(true, |a| !a.is_empty()))
+        if let Some(update) = update_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty()))
         {
             body["update_steps"] = update.clone();
         }
-        if let Some(remove) = remove_steps.filter(|v| v.as_array().map_or(true, |a| !a.is_empty()))
+        if let Some(remove) = remove_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty()))
         {
             body["remove_steps"] = remove.clone();
         }
@@ -2498,19 +2498,10 @@ async fn handle_tool_call(
         }
         "nubi_update_steps" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let is_non_empty = |v: &&Value| v.as_array().map_or(true, |a| !a.is_empty());
-            let add_steps = args
-                .get("add_steps")
-                .filter(|v| !v.is_null())
-                .filter(is_non_empty);
-            let update_steps = args
-                .get("update_steps")
-                .filter(|v| !v.is_null())
-                .filter(is_non_empty);
-            let remove_steps = args
-                .get("remove_steps")
-                .filter(|v| !v.is_null())
-                .filter(is_non_empty);
+            let is_non_empty_array = |v: &&Value| v.as_array().map_or(false, |a| !a.is_empty());
+            let add_steps = args.get("add_steps").filter(is_non_empty_array);
+            let update_steps = args.get("update_steps").filter(is_non_empty_array);
+            let remove_steps = args.get("remove_steps").filter(is_non_empty_array);
             if add_steps.is_none() && update_steps.is_none() && remove_steps.is_none() {
                 return Err(
                     "at least one of add_steps, update_steps, or remove_steps required".to_string(),
