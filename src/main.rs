@@ -912,7 +912,9 @@ impl NubiClient {
             .filter(|c| {
                 let name = c["name"].as_str().unwrap_or("").to_lowercase();
                 let desc = c["description"].as_str().unwrap_or("").to_lowercase();
-                query_words.iter().all(|w| name.contains(w) || desc.contains(w))
+                query_words
+                    .iter()
+                    .all(|w| name.contains(w) || desc.contains(w))
             })
             .cloned()
             .collect();
@@ -1165,11 +1167,7 @@ impl NubiClient {
         Ok(result)
     }
 
-    async fn promote_template(
-        &self,
-        room_id: &str,
-        name: Option<&str>,
-    ) -> Result<Value, String> {
+    async fn promote_template(&self, room_id: &str, name: Option<&str>) -> Result<Value, String> {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/promote",
             self.space_id().await,
@@ -1216,7 +1214,8 @@ impl NubiClient {
         if let Some(remove) = remove_steps {
             body["remove_steps"] = remove.clone();
         }
-        self.request(reqwest::Method::PATCH, &path, Some(body)).await
+        self.request(reqwest::Method::PATCH, &path, Some(body))
+            .await
     }
 
     async fn invite_member(
@@ -2360,7 +2359,12 @@ async fn handle_tool_call(
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
             let is_template = args["is_template"].as_bool().unwrap_or(false);
             client
-                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()), is_template)
+                .create_steps(
+                    name,
+                    parent,
+                    &serde_json::Value::Array(steps.clone()),
+                    is_template,
+                )
                 .await
         }
         "nubi_complete_step" => {
@@ -2448,7 +2452,9 @@ async fn handle_tool_call(
             let status = args["status"].as_str();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
             let is_template = args["is_template"].as_str();
-            client.get_agent_workflows(agent_id, status, limit, is_template).await
+            client
+                .get_agent_workflows(agent_id, status, limit, is_template)
+                .await
         }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2490,7 +2496,14 @@ async fn handle_tool_call(
             let add_steps = args.get("add_steps").filter(|v| !v.is_null());
             let update_steps = args.get("update_steps").filter(|v| !v.is_null());
             let remove_steps = args.get("remove_steps").filter(|v| !v.is_null());
-            client.update_steps(room_id, add_steps, update_steps, remove_steps).await
+            if add_steps.is_none() && update_steps.is_none() && remove_steps.is_none() {
+                return Err(
+                    "at least one of add_steps, update_steps, or remove_steps required".to_string(),
+                );
+            }
+            client
+                .update_steps(room_id, add_steps, update_steps, remove_steps)
+                .await
         }
         "nubi_reload" => {
             client.reload_token().await?;
@@ -3265,7 +3278,12 @@ fn parent_room_arg(args: &Value) -> Option<&str> {
 }
 
 /// The body that creates a workflow, optionally tracked from `parent_room_id`.
-fn create_steps_body(name: &str, parent_room_id: Option<&str>, steps: &Value, is_template: bool) -> Value {
+fn create_steps_body(
+    name: &str,
+    parent_room_id: Option<&str>,
+    steps: &Value,
+    is_template: bool,
+) -> Value {
     let mut steps_inner = json!({ "steps": steps });
     if let Some(parent) = parent_room_id {
         steps_inner["parent_room"] = json!(parent);
