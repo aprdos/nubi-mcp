@@ -1129,8 +1129,8 @@ impl NubiClient {
         &self,
         agent_id: Option<&str>,
         status: Option<&str>,
-        limit: Option<u32>,
         is_template: Option<&str>,
+        limit: Option<u32>,
     ) -> Result<Value, String> {
         let target = match agent_id {
             Some(id) => id.to_string(),
@@ -1145,11 +1145,11 @@ impl NubiClient {
         if let Some(s) = status {
             params.push(format!("status={}", urlencoding::encode(s)));
         }
-        if let Some(l) = limit {
-            params.push(format!("limit={}", l));
-        }
         if let Some(t) = is_template {
             params.push(format!("is_template={}", urlencoding::encode(t)));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={}", l));
         }
         if !params.is_empty() {
             path = format!("{}?{}", path, params.join("&"));
@@ -2141,8 +2141,8 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "agent_id": { "type": "string", "description": "Agent ID to query. Omit to use the calling agent." },
                         "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
-                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" },
-                        "is_template": { "type": "string", "enum": ["true", "false", "all"], "description": "Filter by template status: true = only templates, false = only actual workflows, all = both. Default: exclude templates." }
+                        "is_template": { "type": "string", "enum": ["true", "false", "all"], "description": "Filter by template status: true = only templates, false = only actual workflows, all = both. Default: exclude templates." },
+                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" }
                     }
                 }
             },
@@ -2523,11 +2523,9 @@ async fn handle_tool_call(
         "nubi_get_agent_workflows" => {
             let agent_id = args["agent_id"].as_str();
             let status = args["status"].as_str();
-            let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
             let is_template = args["is_template"].as_str();
-            client
-                .get_agent_workflows(agent_id, status, limit, is_template)
-                .await
+            let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
+            client.get_agent_workflows(agent_id, status, is_template, limit).await
         }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
