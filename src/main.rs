@@ -606,6 +606,18 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
+    /// Build headers for requests that accept `X-Requested-By`.
+    /// Returns an error if the value contains invalid characters (CR/LF).
+    fn requested_by_headers(requested_by: Option<&str>) -> Result<Vec<(&str, &str)>, String> {
+        match requested_by {
+            Some(r) if r.contains('\r') || r.contains('\n') => {
+                Err("requested_by contains invalid characters".into())
+            }
+            Some(r) => Ok(vec![("X-Requested-By", r)]),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Create a skill set. `source_type` defaults to "user"; "system" and
     /// "marketplace" require the admin key.
     async fn create_skill_set(
@@ -615,6 +627,7 @@ impl NubiClient {
         status: Option<&str>,
         source_type: Option<&str>,
         skills: Option<&[Value]>,
+        requested_by: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/skill-sets", self.space_id().await);
         let mut body = json!({ "name": name });
@@ -630,8 +643,9 @@ impl NubiClient {
         if let Some(sk) = skills {
             body["skills"] = json!(sk);
         }
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
-            .request(reqwest::Method::POST, &path, Some(body))
+            .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
         let kind = &meta["kind"];
         Ok(json!({
@@ -709,6 +723,7 @@ impl NubiClient {
         description: Option<&str>,
         collection_id: Option<&str>,
         parent_doc_id: Option<&str>,
+        requested_by: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let mut body = json!({ "name": name, "room_type": "doc" });
@@ -724,8 +739,9 @@ impl NubiClient {
         if let Some(pid) = parent_doc_id.filter(|s| !s.trim().is_empty()) {
             body["parent_doc_id"] = json!(pid);
         }
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
-            .request(reqwest::Method::POST, &path, Some(body))
+            .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
         let kind = &meta["kind"];
         let room_id = meta["id"].as_str().unwrap_or_default();
@@ -832,6 +848,36 @@ impl NubiClient {
         res.json().await.map_err(|e| e.to_string())
     }
 
+    /// Like `request`, but accepts extra headers (e.g. X-Requested-By).
+    async fn request_with_extra_headers(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<Value, String> {
+        let config = self.config.read().await;
+        let url = format!("{}{}", config.base_url, path);
+        let mut req = self
+            .http
+            .request(method, &url)
+            .header("Authorization", format!("Bearer {}", config.token))
+            .header("Content-Type", "application/json");
+        for (name, value) in extra_headers {
+            req = req.header(*name, *value);
+        }
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("HTTP {}: {}", status, text));
+        }
+        res.json().await.map_err(|e| e.to_string())
+    }
+
     async fn space_id(&self) -> String {
         self.config.read().await.space_id.clone()
     }
@@ -885,10 +931,12 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    async fn create_room(&self, name: &str) -> Result<Value, String> {
+    async fn create_room(&self, name: &str, requested_by: Option<&str>) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let body = json!({ "name": name });
-        self.request(reqwest::Method::POST, &path, Some(body)).await
+        let headers = Self::requested_by_headers(requested_by)?;
+        self.request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
+            .await
     }
 
     async fn list_collections(&self) -> Result<Value, String> {
@@ -912,7 +960,9 @@ impl NubiClient {
             .filter(|c| {
                 let name = c["name"].as_str().unwrap_or("").to_lowercase();
                 let desc = c["description"].as_str().unwrap_or("").to_lowercase();
-                query_words.iter().all(|w| name.contains(w) || desc.contains(w))
+                query_words
+                    .iter()
+                    .all(|w| name.contains(w) || desc.contains(w))
             })
             .cloned()
             .collect();
@@ -938,11 +988,13 @@ impl NubiClient {
         name: &str,
         parent_room_id: Option<&str>,
         steps: &Value,
+        requested_by: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let body = create_steps_body(name, parent_room_id, steps);
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
-            .request(reqwest::Method::POST, &path, Some(body))
+            .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
         let room_id = meta["id"].as_str().unwrap_or_default();
         let mut result = json!({
@@ -1765,7 +1817,8 @@ fn tools_list_full() -> Value {
                                 },
                                 "required": ["room_id"]
                             }
-                        }
+                        },
+                        "requested_by": { "type": "string", "description": "Agent ID of the human who requested this resource be created (for attribution when an agent creates on behalf of a human)" }
                     },
                     "required": ["name"]
                 }
@@ -1857,7 +1910,8 @@ fn tools_list_full() -> Value {
                         "content": { "type": "string", "description": "The doc as Markdown: headings, lists, checklists, tables, quotes, code and links" },
                         "description": { "type": "string", "description": "One line on what the doc covers (optional)" },
                         "collection_id": { "type": "string", "description": "Collection to file the doc in (required if parent_doc_id not set)" },
-                        "parent_doc_id": { "type": "string", "description": "Parent doc in the page tree (required if collection_id not set)" }
+                        "parent_doc_id": { "type": "string", "description": "Parent doc in the page tree (required if collection_id not set)" },
+                        "requested_by": { "type": "string", "description": "Agent ID of the human who requested this resource be created (for attribution when an agent creates on behalf of a human)" }
                     },
                     "required": ["name"]
                 }
@@ -1890,7 +1944,8 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string" }
+                        "name": { "type": "string" },
+                        "requested_by": { "type": "string", "description": "Agent ID of the human who requested this resource be created (for attribution when an agent creates on behalf of a human)" }
                     },
                     "required": ["name"]
                 }
@@ -1927,7 +1982,8 @@ fn tools_list_full() -> Value {
                                 },
                                 "required": ["id", "assignees", "description"]
                             }
-                        }
+                        },
+                        "requested_by": { "type": "string", "description": "Agent ID of the human who requested this resource be created (for attribution when an agent creates on behalf of a human)" }
                     },
                     "required": ["name", "steps"]
                 }
@@ -2147,6 +2203,7 @@ async fn handle_tool_call(
         "nubi_create_skill_set" => {
             let name = args["name"].as_str().ok_or("name required")?;
             let skills = args["skills"].as_array().map(|a| a.as_slice());
+            let requested_by = args["requested_by"].as_str();
             client
                 .create_skill_set(
                     name,
@@ -2154,6 +2211,7 @@ async fn handle_tool_call(
                     args["status"].as_str(),
                     args["source_type"].as_str(),
                     skills,
+                    requested_by,
                 )
                 .await
         }
@@ -2197,6 +2255,7 @@ async fn handle_tool_call(
                         .to_string(),
                 );
             }
+            let requested_by = args["requested_by"].as_str();
             client
                 .create_doc(
                     name,
@@ -2204,6 +2263,7 @@ async fn handle_tool_call(
                     args["description"].as_str(),
                     collection_id,
                     parent_doc_id,
+                    requested_by,
                 )
                 .await
         }
@@ -2230,14 +2290,21 @@ async fn handle_tool_call(
         }
         "nubi_create_room" => {
             let name = args["name"].as_str().ok_or("name required")?;
-            client.create_room(name).await
+            let requested_by = args["requested_by"].as_str();
+            client.create_room(name, requested_by).await
         }
         "nubi_create_steps" => {
             let name = args["name"].as_str().ok_or("name required")?;
             let parent = parent_room_arg(args);
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
+            let requested_by = args["requested_by"].as_str();
             client
-                .create_steps(name, parent, &serde_json::Value::Array(steps.clone()))
+                .create_steps(
+                    name,
+                    parent,
+                    &serde_json::Value::Array(steps.clone()),
+                    requested_by,
+                )
                 .await
         }
         "nubi_complete_step" => {
@@ -4992,7 +5059,7 @@ mod tests {
     async fn create_doc_sends_the_first_version() {
         let (client, state) = spawn_doc_engine(two_versions()).await;
         let created = client
-            .create_doc("Rollout", Some("## Context\n"), None, None, None)
+            .create_doc("Rollout", Some("## Context\n"), None, None, None, None)
             .await
             .unwrap();
         assert_eq!(created["room_id"], "new-doc");
@@ -5007,7 +5074,7 @@ mod tests {
 
         // Blank content is left out, so the doc starts with no version
         client
-            .create_doc("Notes", Some("   "), None, None, None)
+            .create_doc("Notes", Some("   "), None, None, None, None)
             .await
             .unwrap();
         assert!(state.lock().await.created[1].get("content").is_none());
@@ -5032,5 +5099,41 @@ mod tests {
         assert_eq!(tool_label("nubi_bogus"), "unknown");
         assert_eq!(tool_label("evil_tool"), "unknown");
         record_tool_call("nubi_bogus", false, Instant::now());
+    }
+
+    #[test]
+    fn creation_tools_expose_optional_requested_by() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
+
+        for tool_name in [
+            "nubi_create_room",
+            "nubi_create_doc",
+            "nubi_create_skill_set",
+            "nubi_create_steps",
+        ] {
+            let tool = find(tool_name);
+            let schema = &tool["inputSchema"];
+            let props = schema["properties"].as_object().unwrap();
+            assert!(
+                props.contains_key("requested_by"),
+                "{tool_name} should have requested_by param"
+            );
+            let required = schema["required"].as_array().unwrap();
+            assert!(
+                !required.contains(&json!("requested_by")),
+                "{tool_name}: requested_by should be optional"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_by_headers_rejects_crlf() {
+        assert!(NubiClient::requested_by_headers(None).unwrap().is_empty());
+        assert!(NubiClient::requested_by_headers(Some("alice")).is_ok());
+        assert!(NubiClient::requested_by_headers(Some("test\r\nX-Evil: pwned")).is_err());
+        assert!(NubiClient::requested_by_headers(Some("test\nfoo")).is_err());
+        assert!(NubiClient::requested_by_headers(Some("test\rfoo")).is_err());
     }
 }
