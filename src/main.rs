@@ -1205,18 +1205,16 @@ impl NubiClient {
             urlencoding::encode(room_id)
         );
         let mut body = json!({});
-        if let Some(add) = add_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty())) {
+        if let Some(add) = add_steps.filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
             body["add_steps"] = add.clone();
         }
-        if let Some(update) = update_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty()))
-        {
+        if let Some(update) = update_steps.filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
             body["update_steps"] = update.clone();
         }
-        if let Some(remove) = remove_steps.filter(|v| v.as_array().map_or(false, |a| !a.is_empty()))
-        {
+        if let Some(remove) = remove_steps.filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
             body["remove_steps"] = remove.clone();
         }
-        if body.as_object().map_or(true, |o| o.is_empty()) {
+        if body.as_object().is_none_or(|o| o.is_empty()) {
             return Err("at least one of add_steps, update_steps, or remove_steps required".into());
         }
         self.request(reqwest::Method::PATCH, &path, Some(body))
@@ -2498,7 +2496,7 @@ async fn handle_tool_call(
         }
         "nubi_update_steps" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let is_non_empty_array = |v: &&Value| v.as_array().map_or(false, |a| !a.is_empty());
+            let is_non_empty_array = |v: &&Value| v.as_array().is_some_and(|a| !a.is_empty());
             let add_steps = args.get("add_steps").filter(is_non_empty_array);
             let update_steps = args.get("update_steps").filter(is_non_empty_array);
             let remove_steps = args.get("remove_steps").filter(is_non_empty_array);
