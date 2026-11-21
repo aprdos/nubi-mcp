@@ -2590,7 +2590,9 @@ async fn handle_tool_call(
             let max_priority = args["max_priority"].as_i64().map(|p| p as i32);
             let limit = args["limit"].as_u64().map(|l| l as u32);
             let from_index = args["from_index"].as_u64();
-            client.query_memory(category, max_priority, limit, from_index).await
+            client
+                .query_memory(category, max_priority, limit, from_index)
+                .await
         }
         "nubi_reload" => {
             client.reload_token().await?;
