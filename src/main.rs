@@ -606,6 +606,18 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
+    /// Build headers for requests that accept `X-Requested-By`.
+    /// Returns an error if the value contains invalid characters (CR/LF).
+    fn requested_by_headers(requested_by: Option<&str>) -> Result<Vec<(&str, &str)>, String> {
+        match requested_by {
+            Some(r) if r.contains('\r') || r.contains('\n') => {
+                Err("requested_by contains invalid characters".into())
+            }
+            Some(r) => Ok(vec![("X-Requested-By", r)]),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Create a skill set. `source_type` defaults to "user"; "system" and
     /// "marketplace" require the admin key.
     async fn create_skill_set(
@@ -631,9 +643,7 @@ impl NubiClient {
         if let Some(sk) = skills {
             body["skills"] = json!(sk);
         }
-        let headers: Vec<(&str, &str)> = requested_by
-            .map(|r| vec![("X-Requested-By", r)])
-            .unwrap_or_default();
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
             .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
@@ -729,9 +739,7 @@ impl NubiClient {
         if let Some(pid) = parent_doc_id.filter(|s| !s.trim().is_empty()) {
             body["parent_doc_id"] = json!(pid);
         }
-        let headers: Vec<(&str, &str)> = requested_by
-            .map(|r| vec![("X-Requested-By", r)])
-            .unwrap_or_default();
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
             .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
@@ -926,9 +934,7 @@ impl NubiClient {
     async fn create_room(&self, name: &str, requested_by: Option<&str>) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let body = json!({ "name": name });
-        let headers: Vec<(&str, &str)> = requested_by
-            .map(|r| vec![("X-Requested-By", r)])
-            .unwrap_or_default();
+        let headers = Self::requested_by_headers(requested_by)?;
         self.request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await
     }
@@ -986,9 +992,7 @@ impl NubiClient {
     ) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms", self.space_id().await);
         let body = create_steps_body(name, parent_room_id, steps);
-        let headers: Vec<(&str, &str)> = requested_by
-            .map(|r| vec![("X-Requested-By", r)])
-            .unwrap_or_default();
+        let headers = Self::requested_by_headers(requested_by)?;
         let meta = self
             .request_with_extra_headers(reqwest::Method::POST, &path, Some(body), &headers)
             .await?;
@@ -5122,5 +5126,14 @@ mod tests {
                 "{tool_name}: requested_by should be optional"
             );
         }
+    }
+
+    #[test]
+    fn requested_by_headers_rejects_crlf() {
+        assert!(NubiClient::requested_by_headers(None).unwrap().is_empty());
+        assert!(NubiClient::requested_by_headers(Some("alice")).is_ok());
+        assert!(NubiClient::requested_by_headers(Some("test\r\nX-Evil: pwned")).is_err());
+        assert!(NubiClient::requested_by_headers(Some("test\nfoo")).is_err());
+        assert!(NubiClient::requested_by_headers(Some("test\rfoo")).is_err());
     }
 }
