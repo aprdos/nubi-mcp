@@ -2396,15 +2396,14 @@ fn tools_list_full() -> Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
-                "name": "nubi_get_agent_workflows",
-                "description": "List Steps workflows an agent can access (as owner, assignee, or member). Omit agent_id to query the calling agent.",
+                "name": "nubi_list_works",
+                "description": "List the Works an agent owns, is assigned to or is a member of, newest first. Omit agent_id for your own. Templates are not Works: list them with nubi_list_work_templates.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "agent_id": { "type": "string", "description": "Agent ID to query. Omit to use the calling agent." },
-                        "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
-                        "is_template": { "type": "string", "enum": ["true", "false", "all"], "description": "Filter by template status: true = only templates, false = only actual workflows, all = both. Default: exclude templates." },
-                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" }
+                        "agent_id": { "type": "string", "description": "Whose Works to list. Omit for your own." },
+                        "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Only Works in this state (default: all)" },
+                        "limit": { "type": "integer", "description": "At most this many (default 50, max 100)" }
                     }
                 }
             },
@@ -2863,10 +2862,14 @@ async fn handle_tool_call(
             Ok(compact_search(result, cursor, &names))
         }
         "nubi_list_agents" => client.list_agents().await,
-        "nubi_get_agent_workflows" => {
+        "nubi_list_works" | "nubi_get_agent_workflows" => {
             let agent_id = args["agent_id"].as_str();
             let status = args["status"].as_str();
-            let is_template = args["is_template"].as_str();
+            // Only the old name still takes is_template; without it the
+            // engine leaves templates out
+            let is_template = (name == "nubi_get_agent_workflows")
+                .then(|| args["is_template"].as_str())
+                .flatten();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
             client
                 .get_agent_workflows(agent_id, status, is_template, limit)
@@ -4104,6 +4107,20 @@ mod tests {
         );
         assert!(review_action("nubi_verify_step", &json!({"action": "reject"})).is_err());
         assert!(review_action("nubi_verify_step", &json!({})).is_err());
+    }
+
+    #[test]
+    fn works_are_listed_without_templates() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let works = tools
+            .iter()
+            .find(|t| t["name"] == "nubi_list_works")
+            .unwrap();
+        assert!(works["inputSchema"]["properties"]["is_template"].is_null());
+        assert!(tools
+            .iter()
+            .all(|t| t["name"] != "nubi_get_agent_workflows"));
     }
 
     #[test]
