@@ -1830,6 +1830,7 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "kind": { "type": "string", "description": "Filter by room kind (e.g. steps, skill, doc, group)." },
                         "include_public": { "type": "boolean", "description": "Include public rooms you are not a member of. Combine with kind filter (e.g. kind=steps, kind=skill) to list public templates or skills." }
                     }
                 }
@@ -2335,8 +2336,9 @@ async fn handle_tool_call(
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => {
+            let kind = args["kind"].as_str();
             let include_public = args["include_public"].as_bool().unwrap_or(false);
-            client.list_rooms(None, include_public).await
+            client.list_rooms(kind, include_public).await
         }
         "nubi_get_mandate" => client.get_mandate().await,
         "nubi_list_skill_sets" => {
