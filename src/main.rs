@@ -1919,6 +1919,46 @@ fn tools_list(hosted: bool) -> Value {
     list
 }
 
+/// Whether a create call saves a template rather than starting a Work.
+/// nubi_create_steps is the old name, kept for agents that still call it:
+/// there `is_template` picks between the two.
+fn creates_template(tool: &str, args: &Value) -> bool {
+    match tool {
+        "nubi_create_work_template" => true,
+        "nubi_create_work" => false,
+        _ => args["is_template"].as_bool().unwrap_or(false),
+    }
+}
+
+/// One step of a Work, as nubi_create_work and nubi_create_work_template take it.
+fn steps_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "The steps, forming a DAG through depends_on",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Unique step ID" },
+                "assignees": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Agent IDs assigned to this step"
+                },
+                "description": { "type": "string", "description": "What the step delivers" },
+                "depends_on": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Step IDs this step waits for"
+                },
+                "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" },
+                "verifier": { "type": "string", "enum": ["none", "default"], "description": "'default': the Work's owner reviews the step before it counts as done. 'none' (the default): it is done once completed." },
+                "completion_mode": { "type": "string", "enum": ["any", "all"], "description": "With several assignees: 'any' (the default) one of them completes it, 'all' each attaches their own part." }
+            },
+            "required": ["id", "assignees", "description"]
+        }
+    })
+}
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
@@ -2115,39 +2155,26 @@ fn tools_list_full() -> Value {
                 }
             },
             {
-                "name": "nubi_create_steps",
-                "description": "Create a workflow: steps with assignees and dependencies. When `parent_room_id` is provided, the workflow is tracked from that thread (must be a thread in a group or task room). When omitted, the workflow is standalone — all work, notices, and evidence live in the Steps room itself. Each assignee is told when their step starts, and completes it with nubi_complete_step. One workflow per piece of work: if one is already running for it (a PR, a task), continue or update that one instead of creating another for each commit or review round. Returns a `url` field — always share it so people can track progress directly.",
+                "name": "nubi_create_work",
+                "description": "Start a Work: steps with assignees and dependencies that run now. Each assignee is told when their step starts and completes it with nubi_complete_step. With `parent_room_id` the Work is tracked from that thread (a thread in a group or task room); without it the Work is standalone and its messages, notices and evidence live in its own room. One Work per piece of work: if one is already running for it (a PR, a task), update that one with nubi_update_steps instead of starting another per commit or review round. Returns a `url` field: always share it so people can follow the progress.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "The workflow's name" },
-                        "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. When omitted, the Steps room is standalone." },
-                        "is_template": { "type": "boolean", "description": "If true, creates a workflow template that cannot execute until promoted. Templates stay in `pending` status and are excluded from workflow history by default." },
-                        "steps": {
-                            "type": "array",
-                            "description": "Array of step definitions forming a DAG",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string", "description": "Unique step ID" },
-                                    "assignees": {
-                                        "type": "array",
-                                        "items": { "type": "string" },
-                                        "description": "Agent IDs assigned to this step"
-                                    },
-                                    "description": { "type": "string" },
-                                    "depends_on": {
-                                        "type": "array",
-                                        "items": { "type": "string" },
-                                        "description": "Step IDs this step depends on"
-                                    },
-                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" },
-                                    "verifier": { "type": "string", "enum": ["none", "default"], "description": "'default': the workflow's owner reviews the step before it counts as done. 'none' (the default): it is done once completed." },
-                                    "completion_mode": { "type": "string", "enum": ["any", "all"], "description": "With several assignees: 'any' (the default) one of them completes it, 'all' each attaches their own part." }
-                                },
-                                "required": ["id", "assignees", "description"]
-                            }
-                        }
+                        "name": { "type": "string", "description": "The Work's name" },
+                        "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. Omit for a standalone Work." },
+                        "steps": steps_schema()
+                    },
+                    "required": ["name", "steps"]
+                }
+            },
+            {
+                "name": "nubi_create_work_template",
+                "description": "Save a Work template: the same steps as nubi_create_work, but nothing runs and nobody is told. Start a Work from it later with nubi_promote_workflow. Use it for a process the team repeats.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "The template's name" },
+                        "steps": steps_schema()
                     },
                     "required": ["name", "steps"]
                 }
@@ -2603,11 +2630,16 @@ async fn handle_tool_call(
             let name = args["name"].as_str().ok_or("name required")?;
             client.create_room(name).await
         }
-        "nubi_create_steps" => {
+        "nubi_create_work" | "nubi_create_work_template" | "nubi_create_steps" => {
+            let is_template = creates_template(name, args);
             let name = args["name"].as_str().ok_or("name required")?;
-            let parent = parent_room_arg(args);
             let steps = args["steps"].as_array().ok_or("steps must be an array")?;
-            let is_template = args["is_template"].as_bool().unwrap_or(false);
+            // A template doesn't run, so it isn't tracked from a thread
+            let parent = if is_template {
+                None
+            } else {
+                parent_room_arg(args)
+            };
             client
                 .create_steps(
                     name,
@@ -3835,12 +3867,29 @@ mod tests {
         let tools = tools_list_full();
         let tools = tools["tools"].as_array().unwrap();
         let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
-        let create = find("nubi_create_steps");
-        let required = create["inputSchema"]["required"].as_array().unwrap();
-        assert!(required.contains(&json!("name")));
-        assert!(required.contains(&json!("steps")));
-        assert!(!required.contains(&json!("parent_room_id")));
-        assert!(!required.contains(&json!("is_template")));
+        let create = find("nubi_create_work");
+        assert_eq!(create["inputSchema"]["required"], json!(["name", "steps"]));
+        assert!(create["inputSchema"]["properties"]["parent_room_id"].is_object());
+        assert!(create["inputSchema"]["properties"]["is_template"].is_null());
+        let template = find("nubi_create_work_template");
+        assert_eq!(
+            template["inputSchema"]["required"],
+            json!(["name", "steps"])
+        );
+        assert!(template["inputSchema"]["properties"]["parent_room_id"].is_null());
+        assert!(template["inputSchema"]["properties"]["is_template"].is_null());
+        // The old name still works but is no longer offered
+        assert!(tools.iter().all(|t| t["name"] != "nubi_create_steps"));
+        assert!(creates_template("nubi_create_work_template", &json!({})));
+        assert!(!creates_template(
+            "nubi_create_work",
+            &json!({"is_template": true})
+        ));
+        assert!(creates_template(
+            "nubi_create_steps",
+            &json!({"is_template": true})
+        ));
+        assert!(!creates_template("nubi_create_steps", &json!({})));
         let complete = find("nubi_complete_step");
         assert_eq!(
             complete["inputSchema"]["required"],
