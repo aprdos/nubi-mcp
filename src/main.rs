@@ -2034,6 +2034,21 @@ fn review_action<'a>(tool: &str, args: &'a Value) -> Result<(&'a str, Option<&'a
     Ok((action, if action == "reject" { feedback } else { None }))
 }
 
+/// The engine's schedule type and value from `cron` or `every`. The old
+/// `schedule_type` + `schedule_value` pair still works for agents that send it.
+fn schedule_timing(args: &Value) -> Result<(&str, &str), String> {
+    let given = |key: &str| args[key].as_str().map(str::trim).filter(|v| !v.is_empty());
+    match (given("cron"), given("every")) {
+        (Some(_), Some(_)) => Err("give cron or every, not both".into()),
+        (Some(cron), None) => Ok(("cron", cron)),
+        (None, Some(every)) => Ok(("interval", every)),
+        (None, None) => match (given("schedule_type"), given("schedule_value")) {
+            (Some(t), Some(v)) => Ok((t, v)),
+            _ => Err("cron or every required".into()),
+        },
+    }
+}
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
@@ -2523,18 +2538,19 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_schedule",
-                "description": "Schedule a workflow template to run on a cron expression or interval. Each run promotes the template to a new Work owned by the target agent, which also takes the steps the template leaves unassigned; steps that name agents keep them. Cron is 5-field UTC; runs are checked once a minute. Returns the schedule room id and next run time.",
+                "description": "Run a Work template on a schedule: give either `cron` (at set times) or `every` (at a fixed interval), not both. Each run starts a new Work from the template, owned by the target agent, which also takes the steps the template leaves unassigned; steps that name agents keep them. Runs are checked once a minute. Returns the schedule room id and next run time.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "template_room": { "type": "string", "description": "Room id of the workflow template to run (a public, active template)" },
+                        "template_room": { "type": "string", "description": "Room id of the Work template to run (a public, active template)" },
                         "target_agent": { "type": "string", "description": "Agent id that runs it and owns each Work. Default: you. Naming another agent needs a space admin" },
-                        "schedule_type": { "type": "string", "enum": ["cron", "interval"], "description": "Type of schedule: 'cron' for cron expression, 'interval' for fixed interval" },
-                        "schedule_value": { "type": "string", "description": "For cron: a 5-field UTC cron expression (e.g. '0 9 * * 1-5'). For interval: a duration like '30m', '6h', '1d'" },
+                        "cron": { "type": "string", "description": "When to run, as a 5-field UTC cron expression, e.g. '0 9 * * 1-5' for 09:00 UTC on weekdays" },
+                        "every": { "type": "string", "description": "How often to run, as a duration: '30m', '6h', '1d'" },
                         "name": { "type": "string", "description": "Optional name for the schedule. Default: the template's name" },
                         "enabled": { "type": "boolean", "description": "Whether the schedule is active. Default true" }
                     },
-                    "required": ["template_room", "schedule_type", "schedule_value"]
+                    "required": ["template_room"],
+                    "oneOf": [{ "required": ["cron"] }, { "required": ["every"] }]
                 }
             },
             {
@@ -2566,7 +2582,7 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "room_id": { "type": "string", "description": "The schedule room id" },
                         "enabled": { "type": "boolean", "description": "Set to true to enable, false to disable" },
-                        "template_room": { "type": "string", "description": "Room id of a workflow template to run from now on" },
+                        "template_room": { "type": "string", "description": "Room id of a Work template to run from now on" },
                         "name": { "type": "string", "description": "New name for the schedule" }
                     },
                     "required": ["room_id"]
@@ -2875,12 +2891,7 @@ async fn handle_tool_call(
                 .as_str()
                 .ok_or("template_room required")?;
             let target_agent = args["target_agent"].as_str();
-            let schedule_type = args["schedule_type"]
-                .as_str()
-                .ok_or("schedule_type required")?;
-            let schedule_value = args["schedule_value"]
-                .as_str()
-                .ok_or("schedule_value required")?;
+            let (schedule_type, schedule_value) = schedule_timing(args)?;
             let name = args["name"].as_str();
             let enabled = args["enabled"].as_bool().unwrap_or(true);
             client
@@ -4049,6 +4060,37 @@ mod tests {
         );
         assert!(review_action("nubi_verify_step", &json!({"action": "reject"})).is_err());
         assert!(review_action("nubi_verify_step", &json!({})).is_err());
+    }
+
+    #[test]
+    fn schedules_take_cron_or_every() {
+        assert_eq!(
+            schedule_timing(&json!({"cron": "0 9 * * 1-5"})).unwrap(),
+            ("cron", "0 9 * * 1-5")
+        );
+        assert_eq!(
+            schedule_timing(&json!({"every": " 6h "})).unwrap(),
+            ("interval", "6h")
+        );
+        assert!(schedule_timing(&json!({"cron": "0 9 * * *", "every": "1h"})).is_err());
+        assert!(schedule_timing(&json!({})).is_err());
+        assert!(schedule_timing(&json!({"every": "  "})).is_err());
+        // The old pair still works
+        assert_eq!(
+            schedule_timing(&json!({"schedule_type": "interval", "schedule_value": "30m"}))
+                .unwrap(),
+            ("interval", "30m")
+        );
+        let tools = tools_list_full();
+        let create = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "nubi_create_schedule")
+            .unwrap()
+            .clone();
+        assert_eq!(create["inputSchema"]["required"], json!(["template_room"]));
+        assert!(create["inputSchema"]["properties"]["schedule_type"].is_null());
     }
 
     #[test]
