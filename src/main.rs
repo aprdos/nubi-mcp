@@ -1454,7 +1454,13 @@ impl NubiClient {
             self.space_id().await,
             urlencoding::encode(room_id)
         );
-        self.request(reqwest::Method::DELETE, &path, None).await
+        let (status, _) = self
+            .request_with_status(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status));
+        }
+        Ok(json!({ "deleted": true, "room_id": room_id }))
     }
 }
 
@@ -1909,6 +1915,7 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "kind": { "type": "string", "description": "Filter by room kind: dm, group, task, calendar, knowledge_base, memory, skill, thread, skill_set, doc, log, steps, space_memory, schedule, scheduled_commands_log." },
                         "include_public": { "type": "boolean", "description": "Include public rooms you are not a member of. Combine with kind filter (e.g. kind=steps, kind=skill) to list public templates or skills." }
                     }
                 }
