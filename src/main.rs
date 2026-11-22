@@ -870,10 +870,17 @@ impl NubiClient {
         ))
     }
 
-    async fn list_rooms(&self, kind: Option<&str>) -> Result<Value, String> {
+    async fn list_rooms(&self, kind: Option<&str>, include_public: bool) -> Result<Value, String> {
         let mut path = format!("/v1/spaces/{}/rooms", self.space_id().await);
+        let mut params = Vec::new();
         if let Some(k) = kind {
-            path = format!("{}?kind={}", path, urlencoding::encode(k));
+            params.push(format!("kind={}", urlencoding::encode(k)));
+        }
+        if include_public {
+            params.push("include_public=true".to_string());
+        }
+        if !params.is_empty() {
+            path = format!("{}?{}", path, params.join("&"));
         }
         self.request(reqwest::Method::GET, &path, None).await
     }
@@ -1105,7 +1112,7 @@ impl NubiClient {
     /// Room id → display name for the rooms the caller belongs to. Threads
     /// and DMs have no name of their own and are left out.
     async fn room_names(&self) -> HashMap<String, String> {
-        let Ok(rooms) = self.list_rooms(None).await else {
+        let Ok(rooms) = self.list_rooms(None, false).await else {
             return HashMap::new();
         };
         rooms
@@ -1820,7 +1827,13 @@ fn tools_list_full() -> Value {
             {
                 "name": "nubi_list_rooms",
                 "description": "List all rooms you are a member of",
-                "inputSchema": { "type": "object", "properties": {} }
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "description": "Filter by room kind: dm, group, task, calendar, knowledge_base, memory, skill, thread, skill_set, doc, log, steps, space_memory, schedule, scheduled_commands_log." },
+                        "include_public": { "type": "boolean", "description": "Include public rooms you are not a member of. Combine with kind filter (e.g. kind=steps, kind=skill) to list public templates or skills." }
+                    }
+                }
             },
             {
                 "name": "nubi_get_mandate",
@@ -2322,7 +2335,11 @@ async fn handle_tool_call(
     notify_tx: &mpsc::UnboundedSender<Value>,
 ) -> Result<Value, String> {
     match name {
-        "nubi_list_rooms" => client.list_rooms(None).await,
+        "nubi_list_rooms" => {
+            let kind = args["kind"].as_str();
+            let include_public = args["include_public"].as_bool().unwrap_or(false);
+            client.list_rooms(kind, include_public).await
+        }
         "nubi_get_mandate" => client.get_mandate().await,
         "nubi_list_skill_sets" => {
             client
@@ -2525,7 +2542,9 @@ async fn handle_tool_call(
             let status = args["status"].as_str();
             let is_template = args["is_template"].as_str();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
-            client.get_agent_workflows(agent_id, status, is_template, limit).await
+            client
+                .get_agent_workflows(agent_id, status, is_template, limit)
+                .await
         }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2588,7 +2607,9 @@ async fn handle_tool_call(
             let max_priority = args["max_priority"].as_i64().map(|p| p as i32);
             let limit = args["limit"].as_u64().map(|l| l as u32);
             let from_index = args["from_index"].as_u64();
-            client.query_memory(category, max_priority, limit, from_index).await
+            client
+                .query_memory(category, max_priority, limit, from_index)
+                .await
         }
         "nubi_reload" => {
             client.reload_token().await?;
