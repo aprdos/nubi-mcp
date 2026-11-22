@@ -1285,6 +1285,16 @@ impl NubiClient {
         .await
     }
 
+    async fn join_room(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}/join",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        self.request(reqwest::Method::POST, &path, Some(json!({})))
+            .await
+    }
+
     async fn create_thread(
         &self,
         room_id: &str,
@@ -2505,6 +2515,17 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_join_room",
+                "description": "Join a public room you are not a member of.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The room id to join" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
                 "name": "nubi_create_thread",
                 "description": "Create a thread on a message. Returns the thread room which you can then send messages to. Also returns an `embed` field — share it so people can jump to the thread.",
                 "inputSchema": {
@@ -2981,6 +3002,10 @@ async fn handle_tool_call(
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
             let role = args["role"].as_str().unwrap_or("member");
             client.invite_member(room_id, agent_id, role).await
+        }
+        "nubi_join_room" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.join_room(room_id).await
         }
         "nubi_create_thread" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -4392,6 +4417,7 @@ mod tests {
             "nubi_get_room",
             "nubi_send",
             "nubi_invite",
+            "nubi_join_room",
         ] {
             let tool = tools.iter().find(|t| t["name"] == name).unwrap();
             for (param, schema) in tool["inputSchema"]["properties"].as_object().unwrap() {
