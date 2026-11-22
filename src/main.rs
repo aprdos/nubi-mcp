@@ -2475,8 +2475,9 @@ async fn handle_tool_call(
 ) -> Result<Value, String> {
     match name {
         "nubi_list_rooms" => {
+            let kind = args["kind"].as_str();
             let include_public = args["include_public"].as_bool().unwrap_or(false);
-            client.list_rooms(None, include_public).await
+            client.list_rooms(kind, include_public).await
         }
         "nubi_get_mandate" => client.get_mandate().await,
         "nubi_list_skill_sets" => {
@@ -2767,6 +2768,9 @@ async fn handle_tool_call(
             let enabled = args["enabled"].as_bool();
             let command = args["command"].as_str();
             let name = args["name"].as_str();
+            if enabled.is_none() && command.is_none() && name.is_none() {
+                return Err("at least one of enabled, command, or name required".to_string());
+            }
             client.update_schedule(room_id, enabled, command, name).await
         }
         "nubi_delete_schedule" => {
