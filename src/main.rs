@@ -2421,8 +2421,7 @@ fn tools_list_full() -> Value {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Words to find. All must match." },
-                        "room_id": { "type": "string", "description": "Only this room. Use room_ids for several." },
-                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Only these rooms. Omit to search every room you can read." },
+                        "room_ids": { "type": "array", "items": { "type": "string" }, "description": "Only these rooms, one or several. Omit to search every room you can read." },
                         "limit": { "type": "number", "description": "Hits per page (default 20, at most 100)." },
                         "cursor": { "type": "string", "description": "next_cursor from the previous result, to get the next page. Keep the query and rooms the same." }
                     },
@@ -2886,7 +2885,7 @@ async fn handle_tool_call(
         }
         "nubi_search" => {
             let query = args["query"].as_str().ok_or("query required")?;
-            // Support both single room_id and room_ids array
+            // room_ids; a single room_id still works for agents that send it
             let room_ids: Option<Vec<String>> = match (args.get("room_ids"), args.get("room_id")) {
                 (Some(Value::Array(arr)), _) => Some(
                     arr.iter()
@@ -4242,6 +4241,20 @@ mod tests {
             doc["inputSchema"]["anyOf"],
             json!([{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }])
         );
+    }
+
+    #[test]
+    fn search_takes_rooms_one_way() {
+        let tools = tools_list_full();
+        let search = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "nubi_search")
+            .unwrap()
+            .clone();
+        assert!(search["inputSchema"]["properties"]["room_id"].is_null());
+        assert!(search["inputSchema"]["properties"]["room_ids"].is_object());
     }
 
     #[test]
