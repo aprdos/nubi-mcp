@@ -2651,8 +2651,7 @@ fn tools_list_full() -> Value {
                         "template_room": { "type": "string", "description": "Room id of a Work template to run from now on" },
                         "name": { "type": "string", "description": "New name for the schedule" }
                     },
-                    "required": ["room_id"],
-                    "anyOf": [{ "required": ["template_room"] }, { "required": ["name"] }]
+                    "required": ["room_id"]
                 }
             },
             {
@@ -5080,6 +5079,8 @@ mod tests {
                 "nubi_create_schedule",
                 "nubi_list_schedules",
                 "nubi_get_schedule",
+                "nubi_pause_schedule",
+                "nubi_resume_schedule",
                 "nubi_update_schedule",
                 "nubi_delete_schedule",
             ] {
