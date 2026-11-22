@@ -1429,6 +1429,9 @@ impl NubiClient {
         command: Option<&str>,
         name: Option<&str>,
     ) -> Result<Value, String> {
+        if enabled.is_none() && command.is_none() && name.is_none() {
+            return Err("at least one of enabled, command, or name required".to_string());
+        }
         let path = format!(
             "/v1/spaces/{}/schedules/{}",
             self.space_id().await,
@@ -2795,9 +2798,6 @@ async fn handle_tool_call(
             let enabled = args["enabled"].as_bool();
             let command = args["command"].as_str();
             let name = args["name"].as_str();
-            if enabled.is_none() && command.is_none() && name.is_none() {
-                return Err("at least one of enabled, command, or name required".to_string());
-            }
             client
                 .update_schedule(room_id, enabled, command, name)
                 .await
@@ -4653,6 +4653,11 @@ mod tests {
                 "nubi_get_doc",
                 "nubi_create_doc",
                 "nubi_update_doc",
+                "nubi_create_schedule",
+                "nubi_list_schedules",
+                "nubi_get_schedule",
+                "nubi_update_schedule",
+                "nubi_delete_schedule",
             ] {
                 assert!(
                     names.contains(&tool),
