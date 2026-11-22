@@ -1429,6 +1429,7 @@ impl NubiClient {
         command: Option<&str>,
         name: Option<&str>,
     ) -> Result<Value, String> {
+        let name = name.filter(|n| !n.trim().is_empty());
         if enabled.is_none() && command.is_none() && name.is_none() {
             return Err("at least one of enabled, command, or name required".to_string());
         }
