@@ -2083,6 +2083,24 @@ fn work_templates_query() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// What a schedule call changes: enabled, template_room, name. Pause and
+/// resume only flip enabled; update changes the rest (and still takes
+/// enabled from agents that send it the old way).
+fn schedule_changes<'a>(
+    tool: &str,
+    args: &'a Value,
+) -> (Option<bool>, Option<&'a str>, Option<&'a str>) {
+    match tool {
+        "nubi_pause_schedule" => (Some(false), None, None),
+        "nubi_resume_schedule" => (Some(true), None, None),
+        _ => (
+            args["enabled"].as_bool(),
+            args["template_room"].as_str(),
+            args["name"].as_str(),
+        ),
+    }
+}
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
@@ -2625,15 +2643,33 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_update_schedule",
-                "description": "Update a schedule's enabled state, template, or name. To change its timing, delete it and create a new one.",
+                "description": "Change which Work template a schedule runs, or its name. To pause or resume it use nubi_pause_schedule / nubi_resume_schedule; to change its timing, delete it and create a new one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "room_id": { "type": "string", "description": "The schedule room id" },
-                        "enabled": { "type": "boolean", "description": "Set to true to enable, false to disable" },
                         "template_room": { "type": "string", "description": "Room id of a Work template to run from now on" },
                         "name": { "type": "string", "description": "New name for the schedule" }
                     },
+                    "required": ["room_id"],
+                    "anyOf": [{ "required": ["template_room"] }, { "required": ["name"] }]
+                }
+            },
+            {
+                "name": "nubi_pause_schedule",
+                "description": "Pause a schedule: it stops starting Works until you resume it. Works it already started keep running.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string", "description": "The schedule room id" } },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_resume_schedule",
+                "description": "Resume a paused schedule: it starts Works again from its next run time.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string", "description": "The schedule room id" } },
                     "required": ["room_id"]
                 }
             },
@@ -2972,11 +3008,9 @@ async fn handle_tool_call(
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_schedule(room_id).await
         }
-        "nubi_update_schedule" => {
+        "nubi_update_schedule" | "nubi_pause_schedule" | "nubi_resume_schedule" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let enabled = args["enabled"].as_bool();
-            let template_room = args["template_room"].as_str();
-            let name = args["name"].as_str();
+            let (enabled, template_room, name) = schedule_changes(name, args);
             client
                 .update_schedule(room_id, enabled, template_room, name)
                 .await
@@ -4204,6 +4238,32 @@ mod tests {
             doc["inputSchema"]["anyOf"],
             json!([{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }])
         );
+    }
+
+    #[test]
+    fn pausing_a_schedule_has_its_own_tools() {
+        let args = json!({"room_id": "s", "template_room": "t", "name": "n", "enabled": true});
+        assert_eq!(
+            schedule_changes("nubi_pause_schedule", &args),
+            (Some(false), None, None)
+        );
+        assert_eq!(
+            schedule_changes("nubi_resume_schedule", &args),
+            (Some(true), None, None)
+        );
+        assert_eq!(
+            schedule_changes("nubi_update_schedule", &args),
+            (Some(true), Some("t"), Some("n"))
+        );
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let update = tools
+            .iter()
+            .find(|t| t["name"] == "nubi_update_schedule")
+            .unwrap();
+        assert!(update["inputSchema"]["properties"]["enabled"].is_null());
+        assert!(tools.iter().any(|t| t["name"] == "nubi_pause_schedule"));
+        assert!(tools.iter().any(|t| t["name"] == "nubi_resume_schedule"));
     }
 
     #[test]
