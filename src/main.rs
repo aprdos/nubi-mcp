@@ -1389,6 +1389,14 @@ impl NubiClient {
         name: Option<&str>,
         enabled: bool,
     ) -> Result<Value, String> {
+        let target_agent =
+            mention_name(target_agent).ok_or("target_agent must be a valid agent id")?;
+        if command.trim().is_empty() {
+            return Err("command cannot be empty".to_string());
+        }
+        if schedule_value.trim().is_empty() {
+            return Err("schedule_value cannot be empty".to_string());
+        }
         let path = format!("/v1/spaces/{}/schedules", self.space_id().await);
         let mut body = json!({
             "target_agent": target_agent,
