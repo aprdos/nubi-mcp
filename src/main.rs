@@ -2188,14 +2188,13 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_skill_set",
-                "description": "Create a skill set. Source type defaults to 'user'; 'system' and 'marketplace' require the admin key.",
+                "description": "Create a skill set: skills bundled in the order agents resolve them, to attach to agents with nubi_attach_skill_set. It starts as a draft unless you give a status.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The skill set's name" },
                         "description": { "type": "string", "description": "A short description (optional)" },
                         "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Publication status (default: draft)" },
-                        "source_type": { "type": "string", "enum": ["user", "system", "marketplace"], "description": "Where the set came from (default: user)" },
                         "skills": {
                             "type": "array",
                             "description": "Skills in resolution order",
@@ -4399,6 +4398,20 @@ mod tests {
                 assert!(schema["description"].is_string(), "{name}.{param}");
             }
         }
+    }
+
+    #[test]
+    fn creating_a_skill_set_offers_no_admin_only_choices() {
+        let tools = tools_list_full();
+        let create = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "nubi_create_skill_set")
+            .unwrap()
+            .clone();
+        assert!(create["inputSchema"]["properties"]["source_type"].is_null());
+        assert!(!create["description"].as_str().unwrap().contains("admin"));
     }
 
     #[test]
