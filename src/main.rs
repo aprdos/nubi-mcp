@@ -1010,7 +1010,7 @@ impl NubiClient {
         step_id: &str,
         evidence: &Value,
     ) -> Result<Value, String> {
-        let body = complete_step_body(evidence)?;
+        let body = complete_step_body(room_id, evidence)?;
         let path = format!(
             "/v1/spaces/{}/rooms/{}/steps/{}/complete",
             self.space_id().await,
@@ -2366,7 +2366,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_complete_step",
-                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the Work's room with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. Also how you resubmit a step that was sent back for revision.",
+                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the Work's room with nubi_send, then pass their indexes here. They must be your own messages. Also how you resubmit a step that was sent back for revision.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2375,15 +2375,8 @@ fn tools_list_full() -> Value {
                         "evidence": {
                             "type": "array",
                             "minItems": 1,
-                            "description": "One or more of your own messages that show the work",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "room_id": { "type": "string", "description": "The Work's own room" },
-                                    "index": { "type": "integer", "description": "The message's index in that room" }
-                                },
-                                "required": ["room_id", "index"]
-                            }
+                            "description": "The indexes of your own messages in the Work's room that show the work, as nubi_send returned them",
+                            "items": { "type": "integer", "minimum": 0 }
                         }
                     },
                     "required": ["room_id", "step_id", "evidence"]
@@ -3876,21 +3869,26 @@ fn create_steps_body(
 }
 
 /// The body that completes a step: the evidence as `[{ room_id, index }]`,
-/// checked here so a wrong shape is explained rather than a bare 400.
-fn complete_step_body(evidence: &Value) -> Result<Value, String> {
-    let items = evidence
-        .as_array()
-        .filter(|a| !a.is_empty())
-        .ok_or("evidence required: one or more of your own messages, each as { room_id, index }")?;
+/// checked here so a wrong shape is explained rather than a bare 400. The
+/// engine only takes messages from the Work's own room, so the tool takes
+/// their indexes; `{ room_id, index }` items still work for agents that
+/// send them the old way.
+fn complete_step_body(room_id: &str, evidence: &Value) -> Result<Value, String> {
+    let items = evidence.as_array().filter(|a| !a.is_empty()).ok_or(
+        "evidence required: the indexes of one or more of your own messages in the Work's room",
+    )?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        let room_id = item["room_id"]
-            .as_str()
-            .ok_or("each evidence item needs a room_id")?;
-        let index = item["index"]
-            .as_u64()
-            .ok_or("each evidence item needs the message's index (a whole number)")?;
-        out.push(json!({ "room_id": room_id, "index": index }));
+        let (room, index) = if item.is_object() {
+            let room = item["room_id"]
+                .as_str()
+                .ok_or("each evidence item needs a room_id")?;
+            (room, item["index"].as_u64())
+        } else {
+            (room_id, item.as_u64())
+        };
+        let index = index.ok_or("each evidence item is a message's index (a whole number)")?;
+        out.push(json!({ "room_id": room, "index": index }));
     }
     Ok(json!({ "evidence": out }))
 }
@@ -4067,17 +4065,23 @@ mod tests {
 
     #[test]
     fn completing_a_step_sends_only_room_and_index_per_message() {
-        let body = complete_step_body(&json!([
-            { "room_id": "work-1", "index": 12, "note": "ignored" },
-            { "room_id": "thread.work-1.12", "index": 0 }
-        ]))
-        .unwrap();
+        let body = complete_step_body("work-1", &json!([12, 14])).unwrap();
         assert_eq!(
             body,
             json!({ "evidence": [
                 { "room_id": "work-1", "index": 12 },
-                { "room_id": "thread.work-1.12", "index": 0 }
+                { "room_id": "work-1", "index": 14 }
             ] })
+        );
+        // The old object shape still works
+        let body = complete_step_body(
+            "work-1",
+            &json!([{ "room_id": "work-1", "index": 12, "note": "ignored" }]),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({ "evidence": [{ "room_id": "work-1", "index": 12 }] })
         );
     }
 
@@ -4087,12 +4091,14 @@ mod tests {
             json!(null),
             json!([]),
             json!("work-1"),
+            json!(["3"]),
+            json!([-1]),
             json!([{ "index": 3 }]),
             json!([{ "room_id": "work-1" }]),
             json!([{ "room_id": "work-1", "index": "3" }]),
             json!([{ "room_id": "work-1", "index": -1 }]),
         ] {
-            assert!(complete_step_body(&bad).is_err(), "{bad}");
+            assert!(complete_step_body("work-1", &bad).is_err(), "{bad}");
         }
     }
 
