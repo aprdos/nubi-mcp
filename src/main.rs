@@ -2247,17 +2247,18 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_doc",
-                "description": "Create a doc (for example a spec drafted from a conversation). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval. Returns a `url` field — always share it so people can access the doc directly.",
+                "description": "Create a doc (for example a spec drafted from a conversation), placed in a collection or under another doc: give collection_id, parent_doc_id or both. Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval. Returns a `url` field — always share it so people can access the doc directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The doc's title" },
                         "content": { "type": "string", "description": "The doc as Markdown: headings, lists, checklists, tables, quotes, code and links" },
                         "description": { "type": "string", "description": "One line on what the doc covers (optional)" },
-                        "collection_id": { "type": "string", "description": "Collection to file the doc in (required if parent_doc_id not set)" },
-                        "parent_doc_id": { "type": "string", "description": "Parent doc in the page tree (required if collection_id not set)" }
+                        "collection_id": { "type": "string", "description": "The collection to file the doc in, as a top-level page (find it with nubi_list_collections or nubi_search_collections)" },
+                        "parent_doc_id": { "type": "string", "description": "The doc to nest this one under, as a sub-page. With collection_id too, it must be the parent's collection" }
                     },
-                    "required": ["name"]
+                    "required": ["name"],
+                    "anyOf": [{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }]
                 }
             },
             {
@@ -4186,6 +4187,22 @@ mod tests {
         assert_eq!(
             q(work_templates_query()),
             ["kind=steps", "is_template=true", "include_public=true"]
+        );
+    }
+
+    #[test]
+    fn a_new_doc_names_where_it_goes_in_its_schema() {
+        let tools = tools_list_full();
+        let doc = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "nubi_create_doc")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            doc["inputSchema"]["anyOf"],
+            json!([{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }])
         );
     }
 
