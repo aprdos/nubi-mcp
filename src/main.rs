@@ -680,6 +680,29 @@ impl NubiClient {
         }))
     }
 
+    /// Delete a room. Only the room owner can delete. DMs cannot be deleted.
+    async fn delete_room(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let (status, body) = self
+            .request_with_status(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !status.is_success() {
+            let msg = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("HTTP {}: {}", status.as_u16(), msg));
+        }
+        Ok(json!({
+            "deleted": true,
+            "room_id": room_id,
+        }))
+    }
+
     /// Doc rooms the caller belongs to, optionally narrowed by status, in a
     /// compact shape: what an agent needs to pick one.
     async fn list_docs(&self, status: Option<&str>) -> Result<Value, String> {
@@ -2083,6 +2106,28 @@ fn work_templates_query() -> Vec<(&'static str, String)> {
     ]
 }
 
+/// What a schedule call changes: enabled, template_room, name. Pause and
+/// resume only flip enabled; update changes the rest (and still takes
+/// enabled from agents that send it the old way).
+fn schedule_changes<'a>(
+    tool: &str,
+    args: &'a Value,
+) -> (Option<bool>, Option<&'a str>, Option<&'a str>) {
+    match tool {
+        "nubi_pause_schedule" => (Some(false), None, None),
+        "nubi_resume_schedule" => (Some(true), None, None),
+        _ => (
+            args["enabled"].as_bool(),
+            args["template_room"].as_str(),
+            args["name"].as_str(),
+        ),
+    }
+}
+
+/// A before_index past any message: history from the latest one. The
+/// largest integer a JSON client keeps exact.
+const LATEST_INDEX: u64 = 9_007_199_254_740_991;
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
@@ -2377,23 +2422,35 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_poll",
-                "description": "Read messages in a room. Call it with only room_id to get what you have not read yet. Returns {messages: [{index, from, at, text, mentions, cc}], has_more, next_index, first_index}, about 4000 tokens at most unless you pass max_tokens. When has_more is true, call again with from_index=next_index; to read older history, pass before_index=first_index.",
+                "description": "Read new messages in a room. Call it with only room_id to get what you have not read yet. Returns {messages: [{index, from, at, text, mentions, cc}], has_more, next_index, first_index}, about 4000 tokens at most unless you pass max_tokens. When has_more is true, call again with from_index=next_index. For older messages use nubi_read_history.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
-                        "from_index": { "type": "number", "description": "Read forwards starting at this index. Defaults to the first message you have not read. Cannot be combined with before_index." },
-                        "before_index": { "type": "number", "description": "Read backwards: returns the messages immediately before this index. Use it to scroll up through history you already passed. Cannot be combined with from_index or wait_ms." },
+                        "room_id": { "type": "string", "description": "The room to read" },
+                        "from_index": { "type": "number", "description": "Read forwards from this index. Default: the first message you have not read." },
                         "max_tokens": { "type": "number", "description": "Stop once the returned messages reach roughly this many tokens." },
                         "mentioned_only": { "type": "boolean", "description": "Only return messages that mention you. Defaults to false." },
-                        "wait_ms": { "type": "number", "description": "Long-poll: wait up to this many milliseconds for a new message instead of returning empty. Cannot be combined with before_index." }
+                        "wait_ms": { "type": "number", "description": "If nothing is new, wait up to this many milliseconds for a message instead of returning empty." }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_read_history",
+                "description": "Read older messages in a room, scrolling back. Returns the messages just before before_index (the latest ones when omitted), in the same shape as nubi_poll. To go further back, call again with before_index=first_index.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The room to read" },
+                        "before_index": { "type": "number", "description": "Return the messages before this index. Default: the room's latest messages" },
+                        "max_tokens": { "type": "number", "description": "Stop once the returned messages reach roughly this many tokens." }
                     },
                     "required": ["room_id"]
                 }
             },
             {
                 "name": "nubi_search",
-                "description": "Find messages across rooms instead of scrolling through history. Every word must match; words are matched by their stem and as prefixes, so \"deploy\" also finds \"deployed\" and \"deployment\", and case does not matter. Use a few distinctive words, not a sentence. Returns {results: [{room, room_name, index, from, at, text}], has_more, next_cursor}, newest first. To read around a hit, nubi_poll that room with before_index set to the hit's index + 1. When has_more is true, call again with the same query and cursor=next_cursor.",
+                "description": "Find messages across rooms instead of scrolling through history. Every word must match; words are matched by their stem and as prefixes, so \"deploy\" also finds \"deployed\" and \"deployment\", and case does not matter. Use a few distinctive words, not a sentence. Returns {results: [{room, room_name, index, from, at, text}], has_more, next_cursor}, newest first. To read around a hit, call nubi_read_history on that room with before_index set to the hit's index + 1. When has_more is true, call again with the same query and cursor=next_cursor.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2506,6 +2563,17 @@ fn tools_list_full() -> Value {
                         "reason": { "type": "string", "description": "Optional reason for skipping" }
                     },
                     "required": ["room_id", "step_id"]
+                }
+            },
+            {
+                "name": "nubi_delete_work",
+                "description": "Delete a Work or a Work template permanently. Only its owner can. This can't be undone.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id to delete" }
+                    },
+                    "required": ["room_id"]
                 }
             },
             {
@@ -2625,15 +2693,32 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_update_schedule",
-                "description": "Update a schedule's enabled state, template, or name. To change its timing, delete it and create a new one.",
+                "description": "Change which Work template a schedule runs, or its name. To pause or resume it use nubi_pause_schedule / nubi_resume_schedule; to change its timing, delete it and create a new one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "room_id": { "type": "string", "description": "The schedule room id" },
-                        "enabled": { "type": "boolean", "description": "Set to true to enable, false to disable" },
                         "template_room": { "type": "string", "description": "Room id of a Work template to run from now on" },
                         "name": { "type": "string", "description": "New name for the schedule" }
                     },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_pause_schedule",
+                "description": "Pause a schedule: it stops starting Works until you resume it. Works it already started keep running.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string", "description": "The schedule room id" } },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_resume_schedule",
+                "description": "Resume a paused schedule: it starts Works again from its next run time.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "room_id": { "type": "string", "description": "The schedule room id" } },
                     "required": ["room_id"]
                 }
             },
@@ -2831,13 +2916,23 @@ async fn handle_tool_call(
             };
             client.send_message(room_id, text, mentions, cc).await
         }
-        "nubi_poll" => {
+        "nubi_poll" | "nubi_read_history" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let from_index = args["from_index"].as_u64();
-            let before_index = args["before_index"].as_u64();
             let max_tokens = args["max_tokens"].as_u64().map(|v| v as u32);
-            let mentioned_only = args["mentioned_only"].as_bool().unwrap_or(false);
-            let wait_ms = args["wait_ms"].as_u64();
+            // History reads backwards only; nubi_poll still takes before_index
+            // from agents that send it the old way
+            let (from_index, before_index, mentioned_only, wait_ms) = if name == "nubi_read_history"
+            {
+                let before = args["before_index"].as_u64().unwrap_or(LATEST_INDEX);
+                (None, Some(before), false, None)
+            } else {
+                (
+                    args["from_index"].as_u64(),
+                    args["before_index"].as_u64(),
+                    args["mentioned_only"].as_bool().unwrap_or(false),
+                    args["wait_ms"].as_u64(),
+                )
+            };
             client
                 .poll(
                     room_id,
@@ -2918,6 +3013,10 @@ async fn handle_tool_call(
             let reason = args["reason"].as_str();
             client.skip_step(room_id, step_id, reason).await
         }
+        "nubi_delete_work" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.delete_room(room_id).await
+        }
         // nubi_promote_workflow is the old name, kept for agents that still call it
         "nubi_start_work_from_template" | "nubi_promote_workflow" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2973,11 +3072,9 @@ async fn handle_tool_call(
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_schedule(room_id).await
         }
-        "nubi_update_schedule" => {
+        "nubi_update_schedule" | "nubi_pause_schedule" | "nubi_resume_schedule" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let enabled = args["enabled"].as_bool();
-            let template_room = args["template_room"].as_str();
-            let name = args["name"].as_str();
+            let (enabled, template_room, name) = schedule_changes(name, args);
             client
                 .update_schedule(room_id, enabled, template_room, name)
                 .await
@@ -4209,6 +4306,44 @@ mod tests {
     }
 
     #[test]
+    fn pausing_a_schedule_has_its_own_tools() {
+        let args = json!({"room_id": "s", "template_room": "t", "name": "n", "enabled": true});
+        assert_eq!(
+            schedule_changes("nubi_pause_schedule", &args),
+            (Some(false), None, None)
+        );
+        assert_eq!(
+            schedule_changes("nubi_resume_schedule", &args),
+            (Some(true), None, None)
+        );
+        assert_eq!(
+            schedule_changes("nubi_update_schedule", &args),
+            (Some(true), Some("t"), Some("n"))
+        );
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let update = tools
+            .iter()
+            .find(|t| t["name"] == "nubi_update_schedule")
+            .unwrap();
+        assert!(update["inputSchema"]["properties"]["enabled"].is_null());
+        assert!(tools.iter().any(|t| t["name"] == "nubi_pause_schedule"));
+        assert!(tools.iter().any(|t| t["name"] == "nubi_resume_schedule"));
+    }
+
+    #[test]
+    fn history_has_its_own_tool() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
+        assert!(find("nubi_poll")["inputSchema"]["properties"]["before_index"].is_null());
+        let history = find("nubi_read_history");
+        assert_eq!(history["inputSchema"]["required"], json!(["room_id"]));
+        assert!(history["inputSchema"]["properties"]["wait_ms"].is_null());
+        assert!(history["inputSchema"]["properties"]["from_index"].is_null());
+    }
+
+    #[test]
     fn iso_utc_formats_unix_millis() {
         assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_utc(951_782_400_000), "2000-02-29T00:00:00Z");
@@ -5022,6 +5157,9 @@ mod tests {
                 "nubi_create_schedule",
                 "nubi_list_schedules",
                 "nubi_get_schedule",
+                "nubi_pause_schedule",
+                "nubi_resume_schedule",
+                "nubi_read_history",
                 "nubi_update_schedule",
                 "nubi_delete_schedule",
             ] {
