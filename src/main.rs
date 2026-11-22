@@ -1289,7 +1289,7 @@ impl NubiClient {
         let path = format!(
             "/v1/spaces/{}/rooms/{}/join",
             self.space_id().await,
-            room_id
+            urlencoding::encode(room_id)
         );
         self.request(reqwest::Method::POST, &path, Some(json!({})))
             .await
