@@ -1382,31 +1382,33 @@ impl NubiClient {
 
     async fn create_schedule(
         &self,
-        target_agent: &str,
-        command: &str,
+        template_room: &str,
+        target_agent: Option<&str>,
         schedule_type: &str,
         schedule_value: &str,
         name: Option<&str>,
         enabled: bool,
     ) -> Result<Value, String> {
-        let target_agent =
-            mention_name(target_agent).ok_or("target_agent must be a valid agent id")?;
-        if command.trim().is_empty() {
-            return Err("command cannot be empty".to_string());
+        let template_room = template_room.trim();
+        if template_room.is_empty() {
+            return Err("template_room cannot be empty".to_string());
         }
         if schedule_value.trim().is_empty() {
             return Err("schedule_value cannot be empty".to_string());
         }
         let path = format!("/v1/spaces/{}/schedules", self.space_id().await);
         let mut body = json!({
-            "target_agent": target_agent,
-            "command": command,
+            "template_room": template_room,
             "schedule": {
                 "type": schedule_type,
                 "value": schedule_value
             },
             "enabled": enabled
         });
+        if let Some(agent) = target_agent.filter(|a| !a.trim().is_empty()) {
+            let agent = mention_name(agent).ok_or("target_agent must be a valid agent id")?;
+            body["target_agent"] = json!(agent);
+        }
         if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
             body["name"] = json!(n);
         }
@@ -1434,13 +1436,13 @@ impl NubiClient {
         &self,
         room_id: &str,
         enabled: Option<bool>,
-        command: Option<&str>,
+        template_room: Option<&str>,
         name: Option<&str>,
     ) -> Result<Value, String> {
-        let command = command.filter(|c| !c.trim().is_empty());
+        let template_room = template_room.map(str::trim).filter(|t| !t.is_empty());
         let name = name.filter(|n| !n.trim().is_empty());
-        if enabled.is_none() && command.is_none() && name.is_none() {
-            return Err("at least one of enabled, command, or name required".to_string());
+        if enabled.is_none() && template_room.is_none() && name.is_none() {
+            return Err("at least one of enabled, template_room, or name required".to_string());
         }
         let path = format!(
             "/v1/spaces/{}/schedules/{}",
@@ -1451,8 +1453,8 @@ impl NubiClient {
         if let Some(e) = enabled {
             body["enabled"] = json!(e);
         }
-        if let Some(c) = command {
-            body["command"] = json!(c);
+        if let Some(t) = template_room {
+            body["template_room"] = json!(t);
         }
         if let Some(n) = name {
             body["name"] = json!(n);
@@ -2494,18 +2496,18 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_schedule",
-                "description": "Create a scheduled command that fires on a cron expression or interval. The command is posted as a message mentioning the target agent, waking it at the scheduled time. Returns the schedule room id and next run time.",
+                "description": "Schedule a workflow template to run on a cron expression or interval. Each run promotes the template to a new Work owned by the target agent, which also takes the steps the template leaves unassigned; steps that name agents keep them. Cron is 5-field UTC; runs are checked once a minute. Returns the schedule room id and next run time.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target_agent": { "type": "string", "description": "Agent id to mention when the schedule fires" },
-                        "command": { "type": "string", "description": "The command text to post" },
+                        "template_room": { "type": "string", "description": "Room id of the workflow template to run (a public, active template)" },
+                        "target_agent": { "type": "string", "description": "Agent id that runs it and owns each Work. Default: you. Naming another agent needs a space admin" },
                         "schedule_type": { "type": "string", "enum": ["cron", "interval"], "description": "Type of schedule: 'cron' for cron expression, 'interval' for fixed interval" },
-                        "schedule_value": { "type": "string", "description": "For cron: a cron expression (e.g. '0 9 * * 1-5'). For interval: duration like '5m', '1h', '30s'" },
-                        "name": { "type": "string", "description": "Optional human-readable name for the schedule" },
+                        "schedule_value": { "type": "string", "description": "For cron: a 5-field UTC cron expression (e.g. '0 9 * * 1-5'). For interval: a duration like '30m', '6h', '1d'" },
+                        "name": { "type": "string", "description": "Optional name for the schedule. Default: the template's name" },
                         "enabled": { "type": "boolean", "description": "Whether the schedule is active. Default true" }
                     },
-                    "required": ["target_agent", "command", "schedule_type", "schedule_value"]
+                    "required": ["template_room", "schedule_type", "schedule_value"]
                 }
             },
             {
@@ -2531,13 +2533,13 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_update_schedule",
-                "description": "Update a schedule's enabled state, command, or name.",
+                "description": "Update a schedule's enabled state, template, or name. To change its timing, delete it and create a new one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "room_id": { "type": "string", "description": "The schedule room id" },
                         "enabled": { "type": "boolean", "description": "Set to true to enable, false to disable" },
-                        "command": { "type": "string", "description": "New command text" },
+                        "template_room": { "type": "string", "description": "Room id of a workflow template to run from now on" },
                         "name": { "type": "string", "description": "New name for the schedule" }
                     },
                     "required": ["room_id"]
@@ -2846,10 +2848,10 @@ async fn handle_tool_call(
                 .await
         }
         "nubi_create_schedule" => {
-            let target_agent = args["target_agent"]
+            let template_room = args["template_room"]
                 .as_str()
-                .ok_or("target_agent required")?;
-            let command = args["command"].as_str().ok_or("command required")?;
+                .ok_or("template_room required")?;
+            let target_agent = args["target_agent"].as_str();
             let schedule_type = args["schedule_type"]
                 .as_str()
                 .ok_or("schedule_type required")?;
@@ -2860,8 +2862,8 @@ async fn handle_tool_call(
             let enabled = args["enabled"].as_bool().unwrap_or(true);
             client
                 .create_schedule(
+                    template_room,
                     target_agent,
-                    command,
                     schedule_type,
                     schedule_value,
                     name,
@@ -2880,10 +2882,10 @@ async fn handle_tool_call(
         "nubi_update_schedule" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let enabled = args["enabled"].as_bool();
-            let command = args["command"].as_str();
+            let template_room = args["template_room"].as_str();
             let name = args["name"].as_str();
             client
-                .update_schedule(room_id, enabled, command, name)
+                .update_schedule(room_id, enabled, template_room, name)
                 .await
         }
         "nubi_delete_schedule" => {
