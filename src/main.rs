@@ -2154,7 +2154,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_list_work_templates",
-                "description": "List the Work templates in the space: saved processes that don't run until you start one with nubi_promote_workflow.",
+                "description": "List the Work templates in the space: saved processes that don't run until you start one with nubi_start_work_from_template.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
@@ -2354,7 +2354,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_work_template",
-                "description": "Save a Work template: the same steps as nubi_create_work, but nothing runs and nobody is told. Start a Work from it later with nubi_promote_workflow. Use it for a process the team repeats.",
+                "description": "Save a Work template: the same steps as nubi_create_work, but nothing runs and nobody is told. Start a Work from it later with nubi_start_work_from_template. Use it for a process the team repeats.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2366,11 +2366,11 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_complete_step",
-                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the workflow's Steps room with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. Also how you resubmit a step that was sent back for revision.",
+                "description": "Complete a step you are assigned, with the messages that show the work. First post the work in the Work's room with nubi_send, then pass those messages here: each is the room id and the index nubi_send returned. They must be your own messages. Also how you resubmit a step that was sent back for revision.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string", "description": "The workflow (Steps room) id" },
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
                         "step_id": { "type": "string", "description": "The step to complete" },
                         "evidence": {
                             "type": "array",
@@ -2379,7 +2379,7 @@ fn tools_list_full() -> Value {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "room_id": { "type": "string", "description": "The Steps room itself" },
+                                    "room_id": { "type": "string", "description": "The Work's own room" },
                                     "index": { "type": "integer", "description": "The message's index in that room" }
                                 },
                                 "required": ["room_id", "index"]
@@ -2554,11 +2554,11 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_skip_step",
-                "description": "Skip a step in a Steps room. Only the room owner can skip steps. Skipping unblocks dependent steps.",
+                "description": "Skip a step of a Work that can't or needn't be done, so the steps waiting on it can start. Only the Work's owner can.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string", "description": "The Steps room id" },
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
                         "step_id": { "type": "string", "description": "The step id to skip" },
                         "reason": { "type": "string", "description": "Optional reason for skipping" }
                     },
@@ -2567,7 +2567,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_delete_work",
-                "description": "Delete a Work (workflow) or Work template permanently. Only the room owner can delete. This is irreversible.",
+                "description": "Delete a Work or a Work template permanently. Only its owner can. This can't be undone.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2577,13 +2577,13 @@ fn tools_list_full() -> Value {
                 }
             },
             {
-                "name": "nubi_promote_workflow",
-                "description": "Promote a workflow template to an actual workflow. Clones the template with `is_template: false`, starts root steps, and kicks off assignees. Returns the new workflow room.",
+                "name": "nubi_start_work_from_template",
+                "description": "Start a Work from a Work template: a copy of its steps that runs now. The steps with nothing to wait on start and their assignees are told. Returns the new Work's room id and url.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string", "description": "The template Steps room id to promote" },
-                        "name": { "type": "string", "description": "Optional custom name for the promoted workflow. Defaults to the template's name." }
+                        "room_id": { "type": "string", "description": "The template's room id (from nubi_list_work_templates)" },
+                        "name": { "type": "string", "description": "A name for the new Work. Default: the template's name" }
                     },
                     "required": ["room_id"]
                 }
@@ -3017,7 +3017,8 @@ async fn handle_tool_call(
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.delete_room(room_id).await
         }
-        "nubi_promote_workflow" => {
+        // nubi_promote_workflow is the old name, kept for agents that still call it
+        "nubi_start_work_from_template" | "nubi_promote_workflow" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let name = args["name"].as_str();
             client.promote_template(room_id, name).await
@@ -4129,7 +4130,8 @@ mod tests {
             complete["inputSchema"]["required"],
             json!(["room_id", "step_id", "evidence"])
         );
-        let promote = find("nubi_promote_workflow");
+        let promote = find("nubi_start_work_from_template");
+        assert!(tools.iter().all(|t| t["name"] != "nubi_promote_workflow"));
         assert_eq!(promote["inputSchema"]["required"], json!(["room_id"]));
         assert_eq!(
             find("nubi_add_steps")["inputSchema"]["required"],
