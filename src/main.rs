@@ -2542,7 +2542,9 @@ async fn handle_tool_call(
             let status = args["status"].as_str();
             let is_template = args["is_template"].as_str();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
-            client.get_agent_workflows(agent_id, status, is_template, limit).await
+            client
+                .get_agent_workflows(agent_id, status, is_template, limit)
+                .await
         }
         "nubi_invite" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
@@ -2605,7 +2607,9 @@ async fn handle_tool_call(
             let max_priority = args["max_priority"].as_i64().map(|p| p as i32);
             let limit = args["limit"].as_u64().map(|l| l as u32);
             let from_index = args["from_index"].as_u64();
-            client.query_memory(category, max_priority, limit, from_index).await
+            client
+                .query_memory(category, max_priority, limit, from_index)
+                .await
         }
         "nubi_reload" => {
             client.reload_token().await?;
