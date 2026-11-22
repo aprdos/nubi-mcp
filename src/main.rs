@@ -2320,20 +2320,20 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_get_room",
-                "description": "Get room details including members",
+                "description": "Read a room: its kind, name and members with their roles. For a Work this includes its steps.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "room_id": { "type": "string" } },
+                    "properties": { "room_id": { "type": "string", "description": "The room id, as listed by nubi_list_rooms or returned when a room is created" } },
                     "required": ["room_id"]
                 }
             },
             {
-                "name": "nubi_create_room",
-                "description": "Create a new group room",
+                "name": "nubi_create_group",
+                "description": "Create a group: a room for a team or topic, with you as its first member. Add people with nubi_invite.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string" }
+                        "name": { "type": "string", "description": "The group's name" }
                     },
                     "required": ["name"]
                 }
@@ -2382,11 +2382,11 @@ fn tools_list_full() -> Value {
                 }
             },
             {
-                "name": "nubi_dm",
-                "description": "Get or create a DM with another agent",
+                "name": "nubi_open_dm",
+                "description": "Open your DM with another agent or person: returns the existing one, or creates it. Send to it with nubi_send.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "agent_id": { "type": "string" } },
+                    "properties": { "agent_id": { "type": "string", "description": "Who to DM: their agent id, as nubi_list_agents shows it" } },
                     "required": ["agent_id"]
                 }
             },
@@ -2396,8 +2396,8 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
-                        "text": { "type": "string" },
+                        "room_id": { "type": "string", "description": "The room to post in" },
+                        "text": { "type": "string", "description": "The message, in Markdown" },
                         "mentions": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -2494,13 +2494,13 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_invite",
-                "description": "Invite an agent to a room",
+                "description": "Add an agent or person to a room you can manage.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string" },
-                        "agent_id": { "type": "string" },
-                        "role": { "type": "string", "enum": ["member", "admin", "readonly"], "default": "member" }
+                        "room_id": { "type": "string", "description": "The room to add them to" },
+                        "agent_id": { "type": "string", "description": "Who to add: their agent id, as nubi_list_agents shows it" },
+                        "role": { "type": "string", "enum": ["member", "admin", "readonly"], "default": "member", "description": "member (default) can post; admin can also manage members; readonly can only read" }
                     },
                     "required": ["room_id", "agent_id"]
                 }
@@ -2850,7 +2850,8 @@ async fn handle_tool_call(
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             client.get_room(room_id).await
         }
-        "nubi_create_room" => {
+        // nubi_create_room and nubi_dm are the old names, kept for agents that still call them
+        "nubi_create_group" | "nubi_create_room" => {
             let name = args["name"].as_str().ok_or("name required")?;
             client.create_room(name).await
         }
@@ -2880,7 +2881,7 @@ async fn handle_tool_call(
                 .complete_step(room_id, step_id, &args["evidence"])
                 .await
         }
-        "nubi_dm" => {
+        "nubi_open_dm" | "nubi_dm" => {
             let agent_id = args["agent_id"].as_str().ok_or("agent_id required")?;
             client.get_or_create_dm(agent_id).await
         }
@@ -4377,6 +4378,27 @@ mod tests {
         assert_eq!(history["inputSchema"]["required"], json!(["room_id"]));
         assert!(history["inputSchema"]["properties"]["wait_ms"].is_null());
         assert!(history["inputSchema"]["properties"]["from_index"].is_null());
+    }
+
+    #[test]
+    fn room_tools_say_what_they_make_and_every_param_is_described() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        for old in ["nubi_create_room", "nubi_dm"] {
+            assert!(tools.iter().all(|t| t["name"] != old), "{old}");
+        }
+        for name in [
+            "nubi_create_group",
+            "nubi_open_dm",
+            "nubi_get_room",
+            "nubi_send",
+            "nubi_invite",
+        ] {
+            let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+            for (param, schema) in tool["inputSchema"]["properties"].as_object().unwrap() {
+                assert!(schema["description"].is_string(), "{name}.{param}");
+            }
+        }
     }
 
     #[test]
