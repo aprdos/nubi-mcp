@@ -2016,6 +2016,22 @@ fn steps_schema() -> Value {
     })
 }
 
+/// The verify action and feedback a review call sends. nubi_verify_step is
+/// the old name, kept for agents that still call it: there `action` picks.
+fn review_action<'a>(tool: &str, args: &'a Value) -> Result<(&'a str, Option<&'a str>), String> {
+    let action = match tool {
+        "nubi_approve_step" => "approve",
+        "nubi_reject_step" => "reject",
+        _ => args["action"].as_str().ok_or("action required")?,
+    };
+    let feedback = args["feedback"].as_str().filter(|f| !f.trim().is_empty());
+    if action == "reject" && feedback.is_none() {
+        return Err("feedback required: say what has to change".to_string());
+    }
+    // An approval carries no feedback
+    Ok((action, if action == "reject" { feedback } else { None }))
+}
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
@@ -2389,17 +2405,28 @@ fn tools_list_full() -> Value {
                 }
             },
             {
-                "name": "nubi_verify_step",
-                "description": "Approve or reject a step that is awaiting verification in a Steps room. Only the configured verifier (room owner by default, or a specific agent) can call this.",
+                "name": "nubi_approve_step",
+                "description": "Approve a step that is waiting for your review, so it counts as done and the steps after it can start. Only the step's reviewer can (the Work's owner unless another agent was named).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string", "description": "The Steps room id" },
-                        "step_id": { "type": "string", "description": "The step id to verify" },
-                        "action": { "type": "string", "enum": ["approve", "reject"], "description": "Whether to approve or reject the step" },
-                        "feedback": { "type": "string", "description": "Required when rejecting: feedback for the assignee explaining what needs revision" }
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
+                        "step_id": { "type": "string", "description": "The step to approve" }
                     },
-                    "required": ["room_id", "step_id", "action"]
+                    "required": ["room_id", "step_id"]
+                }
+            },
+            {
+                "name": "nubi_reject_step",
+                "description": "Send a step that is waiting for your review back to its assignees, with what has to change. They fix it and complete it again with nubi_complete_step. Only the step's reviewer can (the Work's owner unless another agent was named).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
+                        "step_id": { "type": "string", "description": "The step to send back" },
+                        "feedback": { "type": "string", "minLength": 1, "description": "What has to change, for the assignees" }
+                    },
+                    "required": ["room_id", "step_id", "feedback"]
                 }
             },
             {
@@ -2802,14 +2829,10 @@ async fn handle_tool_call(
             let name = args["name"].as_str();
             client.create_thread(room_id, message_index, name).await
         }
-        "nubi_verify_step" => {
+        "nubi_approve_step" | "nubi_reject_step" | "nubi_verify_step" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
             let step_id = args["step_id"].as_str().ok_or("step_id required")?;
-            let action = args["action"].as_str().ok_or("action required")?;
-            let feedback = args["feedback"].as_str();
-            if action == "reject" && feedback.is_none() {
-                return Err("feedback required when rejecting".to_string());
-            }
+            let (action, feedback) = review_action(name, args)?;
             client.verify_step(room_id, step_id, action, feedback).await
         }
         "nubi_skip_step" => {
@@ -3990,6 +4013,40 @@ mod tests {
             (None, None, Some(json!(["b"])))
         );
         assert!(step_changes("nubi_update_steps", &json!({})).is_err());
+    }
+
+    #[test]
+    fn review_tools_say_approve_or_reject() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let find = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap().clone();
+        assert_eq!(
+            find("nubi_approve_step")["inputSchema"]["required"],
+            json!(["room_id", "step_id"])
+        );
+        assert_eq!(
+            find("nubi_reject_step")["inputSchema"]["required"],
+            json!(["room_id", "step_id", "feedback"])
+        );
+        assert!(tools.iter().all(|t| t["name"] != "nubi_verify_step"));
+
+        assert_eq!(
+            review_action("nubi_approve_step", &json!({"feedback": "x"})).unwrap(),
+            ("approve", None)
+        );
+        assert_eq!(
+            review_action("nubi_reject_step", &json!({"feedback": "Add tests"})).unwrap(),
+            ("reject", Some("Add tests"))
+        );
+        assert!(review_action("nubi_reject_step", &json!({"feedback": "  "})).is_err());
+        assert!(review_action("nubi_reject_step", &json!({})).is_err());
+        // The old name still works with its action
+        assert_eq!(
+            review_action("nubi_verify_step", &json!({"action": "approve"})).unwrap(),
+            ("approve", None)
+        );
+        assert!(review_action("nubi_verify_step", &json!({"action": "reject"})).is_err());
+        assert!(review_action("nubi_verify_step", &json!({})).is_err());
     }
 
     #[test]
