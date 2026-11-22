@@ -1930,6 +1930,59 @@ fn creates_template(tool: &str, args: &Value) -> bool {
     }
 }
 
+/// The `add_steps`, `update_steps` and `remove_steps` a step-editing call
+/// sends. nubi_update_steps is the old all-in-one name, kept for agents that
+/// still call it.
+type StepChanges = (Option<Value>, Option<Value>, Option<Value>);
+
+fn step_changes(tool: &str, args: &Value) -> Result<StepChanges, String> {
+    let non_empty = |v: &Value| v.as_array().is_some_and(|a| !a.is_empty());
+    match tool {
+        "nubi_add_steps" => {
+            let steps = args
+                .get("steps")
+                .filter(|v| non_empty(v))
+                .ok_or("steps required")?;
+            Ok((Some(steps.clone()), None, None))
+        }
+        "nubi_edit_step" => {
+            let step_id = args["step_id"].as_str().ok_or("step_id required")?;
+            let mut change = json!({ "id": step_id });
+            if let Some(d) = args["description"].as_str() {
+                change["description"] = json!(d);
+            }
+            if args["assignees"].is_array() {
+                change["assignees"] = args["assignees"].clone();
+            }
+            if change.as_object().is_some_and(|o| o.len() == 1) {
+                return Err("description or assignees required".into());
+            }
+            Ok((None, Some(json!([change])), None))
+        }
+        "nubi_remove_steps" => {
+            let ids = args
+                .get("step_ids")
+                .filter(|v| non_empty(v))
+                .ok_or("step_ids required")?;
+            Ok((None, None, Some(ids.clone())))
+        }
+        _ => {
+            let pick = |key: &str| args.get(key).filter(|v| non_empty(v)).cloned();
+            let changes = (
+                pick("add_steps"),
+                pick("update_steps"),
+                pick("remove_steps"),
+            );
+            if changes.0.is_none() && changes.1.is_none() && changes.2.is_none() {
+                return Err(
+                    "at least one of add_steps, update_steps, or remove_steps required".into(),
+                );
+            }
+            Ok(changes)
+        }
+    }
+}
+
 /// One step of a Work, as nubi_create_work and nubi_create_work_template take it.
 fn steps_schema() -> Value {
     json!({
@@ -2156,7 +2209,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_work",
-                "description": "Start a Work: steps with assignees and dependencies that run now. Each assignee is told when their step starts and completes it with nubi_complete_step. With `parent_room_id` the Work is tracked from that thread (a thread in a group or task room); without it the Work is standalone and its messages, notices and evidence live in its own room. One Work per piece of work: if one is already running for it (a PR, a task), update that one with nubi_update_steps instead of starting another per commit or review round. Returns a `url` field: always share it so people can follow the progress.",
+                "description": "Start a Work: steps with assignees and dependencies that run now. Each assignee is told when their step starts and completes it with nubi_complete_step. With `parent_room_id` the Work is tracked from that thread (a thread in a group or task room); without it the Work is standalone and its messages, notices and evidence live in its own room. One Work per piece of work: if one is already running for it (a PR, a task), change that one with nubi_add_steps, nubi_edit_step or nubi_remove_steps instead of starting another per commit or review round. Returns a `url` field: always share it so people can follow the progress.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2371,49 +2424,42 @@ fn tools_list_full() -> Value {
                 }
             },
             {
-                "name": "nubi_update_steps",
-                "description": "Update workflow steps. Allows adding, modifying, or removing steps in a workflow (template or actual). Respects the workflow's edit_policy.",
+                "name": "nubi_add_steps",
+                "description": "Add steps to a Work or a Work template. New steps may depend on existing ones. Respects the Work's edit_policy.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "room_id": { "type": "string", "description": "The Steps room id" },
-                        "add_steps": {
-                            "type": "array",
-                            "description": "New steps to add to the workflow",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string", "description": "Unique step ID" },
-                                    "assignees": { "type": "array", "items": { "type": "string" }, "description": "Agent IDs assigned to this step" },
-                                    "description": { "type": "string" },
-                                    "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Step IDs this step depends on" },
-                                    "timeout_ms": { "type": "integer", "description": "Optional timeout in ms" },
-                                    "verifier": { "type": "string", "enum": ["none", "default"] },
-                                    "completion_mode": { "type": "string", "enum": ["any", "all"] }
-                                },
-                                "required": ["id", "assignees", "description"]
-                            }
-                        },
-                        "update_steps": {
-                            "type": "array",
-                            "description": "Steps to modify (by id). Only description and assignees can be changed.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": { "type": "string", "description": "The step ID to update" },
-                                    "description": { "type": "string", "description": "New description (optional)" },
-                                    "assignees": { "type": "array", "items": { "type": "string" }, "description": "New assignees (optional)" }
-                                },
-                                "required": ["id"]
-                            }
-                        },
-                        "remove_steps": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Step IDs to remove. Only pending steps that haven't started can be removed."
-                        }
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
+                        "steps": steps_schema()
                     },
-                    "required": ["room_id"]
+                    "required": ["room_id", "steps"]
+                }
+            },
+            {
+                "name": "nubi_edit_step",
+                "description": "Change one step's description or assignees. Nothing else about a step can be changed once it exists. Respects the Work's edit_policy.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
+                        "step_id": { "type": "string", "description": "The step to change" },
+                        "description": { "type": "string", "description": "The new description" },
+                        "assignees": { "type": "array", "items": { "type": "string" }, "description": "The new assignees: agent ids, replacing the current ones" }
+                    },
+                    "required": ["room_id", "step_id"],
+                    "anyOf": [{ "required": ["description"] }, { "required": ["assignees"] }]
+                }
+            },
+            {
+                "name": "nubi_remove_steps",
+                "description": "Remove steps that have not started yet (pending). Steps that started or finished stay; skip one with nubi_skip_step instead. Respects the Work's edit_policy.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id" },
+                        "step_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The steps to remove" }
+                    },
+                    "required": ["room_id", "step_ids"]
                 }
             },
             {
@@ -2773,19 +2819,11 @@ async fn handle_tool_call(
             let name = args["name"].as_str();
             client.promote_template(room_id, name).await
         }
-        "nubi_update_steps" => {
+        "nubi_add_steps" | "nubi_edit_step" | "nubi_remove_steps" | "nubi_update_steps" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
-            let is_non_empty_array = |v: &&Value| v.as_array().is_some_and(|a| !a.is_empty());
-            let add_steps = args.get("add_steps").filter(is_non_empty_array);
-            let update_steps = args.get("update_steps").filter(is_non_empty_array);
-            let remove_steps = args.get("remove_steps").filter(is_non_empty_array);
-            if add_steps.is_none() && update_steps.is_none() && remove_steps.is_none() {
-                return Err(
-                    "at least one of add_steps, update_steps, or remove_steps required".to_string(),
-                );
-            }
+            let (add, update, remove) = step_changes(name, args)?;
             client
-                .update_steps(room_id, add_steps, update_steps, remove_steps)
+                .update_steps(room_id, add.as_ref(), update.as_ref(), remove.as_ref())
                 .await
         }
         "nubi_append_memory" => {
@@ -3897,8 +3935,56 @@ mod tests {
         );
         let promote = find("nubi_promote_workflow");
         assert_eq!(promote["inputSchema"]["required"], json!(["room_id"]));
-        let update = find("nubi_update_steps");
-        assert_eq!(update["inputSchema"]["required"], json!(["room_id"]));
+        assert_eq!(
+            find("nubi_add_steps")["inputSchema"]["required"],
+            json!(["room_id", "steps"])
+        );
+        assert_eq!(
+            find("nubi_edit_step")["inputSchema"]["required"],
+            json!(["room_id", "step_id"])
+        );
+        assert_eq!(
+            find("nubi_remove_steps")["inputSchema"]["required"],
+            json!(["room_id", "step_ids"])
+        );
+        assert!(tools.iter().all(|t| t["name"] != "nubi_update_steps"));
+    }
+
+    #[test]
+    fn step_tools_send_one_kind_of_change() {
+        let step = json!({"id": "b", "assignees": ["pine"], "description": "Review"});
+        assert_eq!(
+            step_changes("nubi_add_steps", &json!({"steps": [step.clone()]})).unwrap(),
+            (Some(json!([step])), None, None)
+        );
+        assert_eq!(
+            step_changes(
+                "nubi_edit_step",
+                &json!({"step_id": "b", "assignees": ["lime"]})
+            )
+            .unwrap(),
+            (
+                None,
+                Some(json!([{"id": "b", "assignees": ["lime"]}])),
+                None
+            )
+        );
+        assert!(step_changes("nubi_edit_step", &json!({"step_id": "b"})).is_err());
+        assert_eq!(
+            step_changes("nubi_remove_steps", &json!({"step_ids": ["b"]})).unwrap(),
+            (None, None, Some(json!(["b"])))
+        );
+        assert!(step_changes("nubi_remove_steps", &json!({"step_ids": []})).is_err());
+        // The old name still takes all three at once
+        assert_eq!(
+            step_changes(
+                "nubi_update_steps",
+                &json!({"remove_steps": ["b"], "add_steps": []})
+            )
+            .unwrap(),
+            (None, None, Some(json!(["b"])))
+        );
+        assert!(step_changes("nubi_update_steps", &json!({})).is_err());
     }
 
     #[test]
