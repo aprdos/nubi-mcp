@@ -1377,6 +1377,104 @@ impl NubiClient {
         let mut config = self.config.write().await;
         config.reload_token()
     }
+
+    // --- Schedule CRUD ---
+
+    async fn create_schedule(
+        &self,
+        target_agent: &str,
+        command: &str,
+        schedule_type: &str,
+        schedule_value: &str,
+        name: Option<&str>,
+        enabled: bool,
+    ) -> Result<Value, String> {
+        let target_agent =
+            mention_name(target_agent).ok_or("target_agent must be a valid agent id")?;
+        if command.trim().is_empty() {
+            return Err("command cannot be empty".to_string());
+        }
+        if schedule_value.trim().is_empty() {
+            return Err("schedule_value cannot be empty".to_string());
+        }
+        let path = format!("/v1/spaces/{}/schedules", self.space_id().await);
+        let mut body = json!({
+            "target_agent": target_agent,
+            "command": command,
+            "schedule": {
+                "type": schedule_type,
+                "value": schedule_value
+            },
+            "enabled": enabled
+        });
+        if let Some(n) = name.filter(|n| !n.trim().is_empty()) {
+            body["name"] = json!(n);
+        }
+        self.request(reqwest::Method::POST, &path, Some(body)).await
+    }
+
+    async fn list_schedules(&self, agent_id: Option<&str>) -> Result<Value, String> {
+        let mut path = format!("/v1/spaces/{}/schedules", self.space_id().await);
+        if let Some(id) = agent_id {
+            path = format!("{}?agent_id={}", path, urlencoding::encode(id));
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    async fn get_schedule(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/schedules/{}",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    async fn update_schedule(
+        &self,
+        room_id: &str,
+        enabled: Option<bool>,
+        command: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Value, String> {
+        let command = command.filter(|c| !c.trim().is_empty());
+        let name = name.filter(|n| !n.trim().is_empty());
+        if enabled.is_none() && command.is_none() && name.is_none() {
+            return Err("at least one of enabled, command, or name required".to_string());
+        }
+        let path = format!(
+            "/v1/spaces/{}/schedules/{}",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let mut body = json!({});
+        if let Some(e) = enabled {
+            body["enabled"] = json!(e);
+        }
+        if let Some(c) = command {
+            body["command"] = json!(c);
+        }
+        if let Some(n) = name {
+            body["name"] = json!(n);
+        }
+        self.request(reqwest::Method::PATCH, &path, Some(body))
+            .await
+    }
+
+    async fn delete_schedule(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/schedules/{}",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let (status, _) = self
+            .request_with_status(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status));
+        }
+        Ok(json!({ "deleted": true, "room_id": room_id }))
+    }
 }
 
 // --- Subscription Manager ---
@@ -2318,6 +2416,68 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_create_schedule",
+                "description": "Create a scheduled command that fires on a cron expression or interval. The command is posted as a message mentioning the target agent, waking it at the scheduled time. Returns the schedule room id and next run time.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target_agent": { "type": "string", "description": "Agent id to mention when the schedule fires" },
+                        "command": { "type": "string", "description": "The command text to post" },
+                        "schedule_type": { "type": "string", "enum": ["cron", "interval"], "description": "Type of schedule: 'cron' for cron expression, 'interval' for fixed interval" },
+                        "schedule_value": { "type": "string", "description": "For cron: a cron expression (e.g. '0 9 * * 1-5'). For interval: duration like '5m', '1h', '30s'" },
+                        "name": { "type": "string", "description": "Optional human-readable name for the schedule" },
+                        "enabled": { "type": "boolean", "description": "Whether the schedule is active. Default true" }
+                    },
+                    "required": ["target_agent", "command", "schedule_type", "schedule_value"]
+                }
+            },
+            {
+                "name": "nubi_list_schedules",
+                "description": "List schedules in the space. Optionally filter by target agent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "agent_id": { "type": "string", "description": "Filter to schedules targeting this agent" }
+                    }
+                }
+            },
+            {
+                "name": "nubi_get_schedule",
+                "description": "Get details of a specific schedule by its room id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The schedule room id" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_update_schedule",
+                "description": "Update a schedule's enabled state, command, or name.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The schedule room id" },
+                        "enabled": { "type": "boolean", "description": "Set to true to enable, false to disable" },
+                        "command": { "type": "string", "description": "New command text" },
+                        "name": { "type": "string", "description": "New name for the schedule" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
+                "name": "nubi_delete_schedule",
+                "description": "Delete a schedule permanently.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The schedule room id to delete" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
                 "name": "nubi_reload",
                 "description": "Reload token from file (requires NUBI_TOKEN_FILE env var). Use after updating the token file.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -2610,6 +2770,51 @@ async fn handle_tool_call(
             client
                 .query_memory(category, max_priority, limit, from_index)
                 .await
+        }
+        "nubi_create_schedule" => {
+            let target_agent = args["target_agent"]
+                .as_str()
+                .ok_or("target_agent required")?;
+            let command = args["command"].as_str().ok_or("command required")?;
+            let schedule_type = args["schedule_type"]
+                .as_str()
+                .ok_or("schedule_type required")?;
+            let schedule_value = args["schedule_value"]
+                .as_str()
+                .ok_or("schedule_value required")?;
+            let name = args["name"].as_str();
+            let enabled = args["enabled"].as_bool().unwrap_or(true);
+            client
+                .create_schedule(
+                    target_agent,
+                    command,
+                    schedule_type,
+                    schedule_value,
+                    name,
+                    enabled,
+                )
+                .await
+        }
+        "nubi_list_schedules" => {
+            let agent_id = args["agent_id"].as_str();
+            client.list_schedules(agent_id).await
+        }
+        "nubi_get_schedule" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.get_schedule(room_id).await
+        }
+        "nubi_update_schedule" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            let enabled = args["enabled"].as_bool();
+            let command = args["command"].as_str();
+            let name = args["name"].as_str();
+            client
+                .update_schedule(room_id, enabled, command, name)
+                .await
+        }
+        "nubi_delete_schedule" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.delete_schedule(room_id).await
         }
         "nubi_reload" => {
             client.reload_token().await?;
@@ -4458,6 +4663,11 @@ mod tests {
                 "nubi_get_doc",
                 "nubi_create_doc",
                 "nubi_update_doc",
+                "nubi_create_schedule",
+                "nubi_list_schedules",
+                "nubi_get_schedule",
+                "nubi_update_schedule",
+                "nubi_delete_schedule",
             ] {
                 assert!(
                     names.contains(&tool),
