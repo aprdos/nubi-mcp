@@ -1830,7 +1830,7 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "description": "Filter by room kind (e.g. steps, skill, doc, group)." },
+                        "kind": { "type": "string", "description": "Filter by room kind: dm, group, task, calendar, knowledge_base, memory, skill, thread, skill_set, doc, log, steps, space_memory, schedule, scheduled_commands_log." },
                         "include_public": { "type": "boolean", "description": "Include public rooms you are not a member of. Combine with kind filter (e.g. kind=steps, kind=skill) to list public templates or skills." }
                     }
                 }
