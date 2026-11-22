@@ -1951,7 +1951,11 @@ fn step_changes(tool: &str, args: &Value) -> Result<StepChanges, String> {
             if let Some(d) = args["description"].as_str() {
                 change["description"] = json!(d);
             }
-            if args["assignees"].is_array() {
+            if let Some(assignees) = args["assignees"].as_array() {
+                // A step always has someone on it
+                if assignees.is_empty() {
+                    return Err("assignees can't be empty".into());
+                }
                 change["assignees"] = args["assignees"].clone();
             }
             if change.as_object().is_some_and(|o| o.len() == 1) {
@@ -2444,7 +2448,7 @@ fn tools_list_full() -> Value {
                         "room_id": { "type": "string", "description": "The Work (Steps room) id" },
                         "step_id": { "type": "string", "description": "The step to change" },
                         "description": { "type": "string", "description": "The new description" },
-                        "assignees": { "type": "array", "items": { "type": "string" }, "description": "The new assignees: agent ids, replacing the current ones" }
+                        "assignees": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The new assignees: agent ids, replacing the current ones" }
                     },
                     "required": ["room_id", "step_id"],
                     "anyOf": [{ "required": ["description"] }, { "required": ["assignees"] }]
@@ -3970,6 +3974,7 @@ mod tests {
             )
         );
         assert!(step_changes("nubi_edit_step", &json!({"step_id": "b"})).is_err());
+        assert!(step_changes("nubi_edit_step", &json!({"step_id": "b", "assignees": []})).is_err());
         assert_eq!(
             step_changes("nubi_remove_steps", &json!({"step_ids": ["b"]})).unwrap(),
             (None, None, Some(json!(["b"])))
