@@ -2292,7 +2292,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_doc",
-                "description": "Create a doc (for example a spec drafted from a conversation), placed in a collection or under another doc: give collection_id, parent_doc_id or both. Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval. Returns a `url` field — always share it so people can access the doc directly.",
+                "description": "Create a doc (for example a spec drafted from a conversation), placed in a collection or under another doc: give collection_id, parent_doc_id or both (at least one is required). Content is Markdown and becomes version 1. Docs start as drafts; people move them to review and approval. Returns a `url` field — always share it so people can access the doc directly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2302,8 +2302,7 @@ fn tools_list_full() -> Value {
                         "collection_id": { "type": "string", "description": "The collection to file the doc in, as a top-level page (find it with nubi_list_collections or nubi_search_collections)" },
                         "parent_doc_id": { "type": "string", "description": "The doc to nest this one under, as a sub-page. With collection_id too, it must be the parent's collection" }
                     },
-                    "required": ["name"],
-                    "anyOf": [{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }]
+                    "required": ["name"]
                 }
             },
             {
@@ -2594,7 +2593,7 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_edit_step",
-                "description": "Change one step's description or assignees. Nothing else about a step can be changed once it exists. Respects the Work's edit_policy.",
+                "description": "Change one step's description or assignees: give at least one of the two. Nothing else about a step can be changed once it exists. Respects the Work's edit_policy.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2603,8 +2602,7 @@ fn tools_list_full() -> Value {
                         "description": { "type": "string", "description": "The new description" },
                         "assignees": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The new assignees: agent ids, replacing the current ones" }
                     },
-                    "required": ["room_id", "step_id"],
-                    "anyOf": [{ "required": ["description"] }, { "required": ["assignees"] }]
+                    "required": ["room_id", "step_id"]
                 }
             },
             {
@@ -2658,8 +2656,7 @@ fn tools_list_full() -> Value {
                         "name": { "type": "string", "description": "Optional name for the schedule. Default: the template's name" },
                         "enabled": { "type": "boolean", "description": "Whether the schedule is active. Default true" }
                     },
-                    "required": ["template_room"],
-                    "oneOf": [{ "required": ["cron"] }, { "required": ["every"] }]
+                    "required": ["template_room"]
                 }
             },
             {
@@ -4304,10 +4301,30 @@ mod tests {
             .find(|t| t["name"] == "nubi_create_doc")
             .unwrap()
             .clone();
-        assert_eq!(
-            doc["inputSchema"]["anyOf"],
-            json!([{ "required": ["collection_id"] }, { "required": ["parent_doc_id"] }])
-        );
+        // Said in the descriptions, checked by the handler: a top-level
+        // anyOf would hide the tool (see no_tool_schema_combines_at_the_top)
+        let props = &doc["inputSchema"]["properties"];
+        assert!(props["collection_id"]["description"].is_string());
+        assert!(props["parent_doc_id"]["description"].is_string());
+    }
+
+    /// Claude's tool API refuses an input schema with oneOf, anyOf or allOf
+    /// at its top level, and clients then drop the tool: agents never see it.
+    /// Either/or rules belong in the description and the handler.
+    #[test]
+    fn no_tool_schema_combines_at_the_top() {
+        let tools = tools_list_full();
+        for tool in tools["tools"].as_array().unwrap() {
+            let schema = tool["inputSchema"].as_object().unwrap();
+            assert_eq!(schema["type"], "object", "{}", tool["name"]);
+            for keyword in ["oneOf", "anyOf", "allOf"] {
+                assert!(
+                    !schema.contains_key(keyword),
+                    "{} has a top-level {keyword}",
+                    tool["name"]
+                );
+            }
+        }
     }
 
     #[test]
