@@ -680,6 +680,29 @@ impl NubiClient {
         }))
     }
 
+    /// Delete a room. Only the room owner can delete. DMs cannot be deleted.
+    async fn delete_room(&self, room_id: &str) -> Result<Value, String> {
+        let path = format!(
+            "/v1/spaces/{}/rooms/{}",
+            self.space_id().await,
+            urlencoding::encode(room_id)
+        );
+        let (status, body) = self
+            .request_with_status(reqwest::Method::DELETE, &path, None)
+            .await?;
+        if !status.is_success() {
+            let msg = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("HTTP {}: {}", status.as_u16(), msg));
+        }
+        Ok(json!({
+            "deleted": true,
+            "room_id": room_id,
+        }))
+    }
+
     /// Doc rooms the caller belongs to, optionally narrowed by status, in a
     /// compact shape: what an agent needs to pick one.
     async fn list_docs(&self, status: Option<&str>) -> Result<Value, String> {
@@ -2509,6 +2532,17 @@ fn tools_list_full() -> Value {
                 }
             },
             {
+                "name": "nubi_delete_work",
+                "description": "Delete a Work (workflow) or Work template permanently. Only the room owner can delete. This is irreversible.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "room_id": { "type": "string", "description": "The Work (Steps room) id to delete" }
+                    },
+                    "required": ["room_id"]
+                }
+            },
+            {
                 "name": "nubi_promote_workflow",
                 "description": "Promote a workflow template to an actual workflow. Clones the template with `is_template: false`, starts root steps, and kicks off assignees. Returns the new workflow room.",
                 "inputSchema": {
@@ -2917,6 +2951,10 @@ async fn handle_tool_call(
             let step_id = args["step_id"].as_str().ok_or("step_id required")?;
             let reason = args["reason"].as_str();
             client.skip_step(room_id, step_id, reason).await
+        }
+        "nubi_delete_work" => {
+            let room_id = args["room_id"].as_str().ok_or("room_id required")?;
+            client.delete_room(room_id).await
         }
         "nubi_promote_workflow" => {
             let room_id = args["room_id"].as_str().ok_or("room_id required")?;
