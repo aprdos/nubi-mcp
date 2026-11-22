@@ -885,8 +885,20 @@ impl NubiClient {
         self.request(reqwest::Method::GET, &path, None).await
     }
 
-    /// Skill rooms the caller belongs to, optionally narrowed by status.
-    ///
+    /// Rooms matching a query string's filters (see [`skills_query`]).
+    async fn list_rooms_where(&self, query: &[(&str, String)]) -> Result<Value, String> {
+        let params: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+            .collect();
+        let path = format!(
+            "/v1/spaces/{}/rooms?{}",
+            self.space_id().await,
+            params.join("&")
+        );
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
     async fn get_room(&self, room_id: &str) -> Result<Value, String> {
         let path = format!("/v1/spaces/{}/rooms/{}", self.space_id().await, room_id);
         self.request(reqwest::Method::GET, &path, None).await
@@ -2049,19 +2061,56 @@ fn schedule_timing(args: &Value) -> Result<(&str, &str), String> {
     }
 }
 
+/// Every skill room in the space, public ones included.
+fn skills_query(status: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut q = vec![
+        ("kind", "skill".to_string()),
+        ("include_public", "true".to_string()),
+    ];
+    if let Some(s) = status {
+        q.push(("status", s.to_string()));
+    }
+    q
+}
+
+/// Every Work template in the space. The engine lists templates only when
+/// asked with is_template; with it, it lists every public one.
+fn work_templates_query() -> Vec<(&'static str, String)> {
+    vec![
+        ("kind", "steps".to_string()),
+        ("is_template", "true".to_string()),
+        ("include_public", "true".to_string()),
+    ]
+}
+
 fn tools_list_full() -> Value {
     json!({
         "tools": [
             {
                 "name": "nubi_list_rooms",
-                "description": "List all rooms you are a member of",
+                "description": "List the rooms you are a member of: DMs, groups, tasks, threads and the rest. For skills use nubi_list_skills, for Work templates nubi_list_work_templates, for docs nubi_list_docs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "description": "Filter by room kind: dm, group, task, calendar, knowledge_base, memory, skill, thread, skill_set, doc, log, steps, space_memory, schedule, scheduled_commands_log." },
-                        "include_public": { "type": "boolean", "description": "Include public rooms you are not a member of. Combine with kind filter (e.g. kind=steps, kind=skill) to list public templates or skills." }
+                        "kind": { "type": "string", "description": "Only rooms of this kind, e.g. dm, group, task, thread, doc, steps, schedule." },
+                        "include_public": { "type": "boolean", "description": "Also list public rooms you are not a member of." }
                     }
                 }
+            },
+            {
+                "name": "nubi_list_skills",
+                "description": "List the skills in the space, including public ones you are not a member of, to find one to read or to add to a skill set.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["draft", "published", "archived"], "description": "Only skills in this status" }
+                    }
+                }
+            },
+            {
+                "name": "nubi_list_work_templates",
+                "description": "List the Work templates in the space: saved processes that don't run until you start one with nubi_promote_workflow.",
+                "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "nubi_get_mandate",
@@ -2362,15 +2411,14 @@ fn tools_list_full() -> Value {
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
-                "name": "nubi_get_agent_workflows",
-                "description": "List Steps workflows an agent can access (as owner, assignee, or member). Omit agent_id to query the calling agent.",
+                "name": "nubi_list_works",
+                "description": "List the Works an agent owns, is assigned to or is a member of, newest first. Omit agent_id for your own. Templates are not Works: list them with nubi_list_work_templates.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "agent_id": { "type": "string", "description": "Agent ID to query. Omit to use the calling agent." },
-                        "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Filter by workflow status. Default: 'all'" },
-                        "is_template": { "type": "string", "enum": ["true", "false", "all"], "description": "Filter by template status: true = only templates, false = only actual workflows, all = both. Default: exclude templates." },
-                        "limit": { "type": "integer", "description": "Max workflows to return. Default: 50, max: 100" }
+                        "agent_id": { "type": "string", "description": "Whose Works to list. Omit for your own." },
+                        "status": { "type": "string", "enum": ["active", "pending", "complete", "all"], "description": "Only Works in this state (default: all)" },
+                        "limit": { "type": "integer", "description": "At most this many (default 50, max 100)" }
                     }
                 }
             },
@@ -2622,6 +2670,12 @@ async fn handle_tool_call(
             let include_public = args["include_public"].as_bool().unwrap_or(false);
             client.list_rooms(kind, include_public).await
         }
+        "nubi_list_skills" => {
+            client
+                .list_rooms_where(&skills_query(args["status"].as_str()))
+                .await
+        }
+        "nubi_list_work_templates" => client.list_rooms_where(&work_templates_query()).await,
         "nubi_get_mandate" => client.get_mandate().await,
         "nubi_list_skill_sets" => {
             client
@@ -2824,10 +2878,14 @@ async fn handle_tool_call(
             Ok(compact_search(result, cursor, &names))
         }
         "nubi_list_agents" => client.list_agents().await,
-        "nubi_get_agent_workflows" => {
+        "nubi_list_works" | "nubi_get_agent_workflows" => {
             let agent_id = args["agent_id"].as_str();
             let status = args["status"].as_str();
-            let is_template = args["is_template"].as_str();
+            // Only the old name still takes is_template; without it the
+            // engine leaves templates out
+            let is_template = (name == "nubi_get_agent_workflows")
+                .then(|| args["is_template"].as_str())
+                .flatten();
             let limit = args["limit"].as_u64().map(|v| v.min(100) as u32);
             client
                 .get_agent_workflows(agent_id, status, is_template, limit)
@@ -4091,6 +4149,44 @@ mod tests {
             .clone();
         assert_eq!(create["inputSchema"]["required"], json!(["template_room"]));
         assert!(create["inputSchema"]["properties"]["schedule_type"].is_null());
+    }
+
+    #[test]
+    fn works_are_listed_without_templates() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        let works = tools
+            .iter()
+            .find(|t| t["name"] == "nubi_list_works")
+            .unwrap();
+        assert!(works["inputSchema"]["properties"]["is_template"].is_null());
+        assert!(tools
+            .iter()
+            .all(|t| t["name"] != "nubi_get_agent_workflows"));
+    }
+
+    #[test]
+    fn skills_and_templates_have_their_own_list_tools() {
+        let tools = tools_list_full();
+        let tools = tools["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t["name"] == "nubi_list_skills"));
+        assert!(tools
+            .iter()
+            .any(|t| t["name"] == "nubi_list_work_templates"));
+        let q = |v: Vec<(&str, String)>| {
+            v.into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(q(skills_query(None)), ["kind=skill", "include_public=true"]);
+        assert_eq!(
+            q(skills_query(Some("published"))),
+            ["kind=skill", "include_public=true", "status=published"]
+        );
+        assert_eq!(
+            q(work_templates_query()),
+            ["kind=steps", "is_template=true", "include_public=true"]
+        );
     }
 
     #[test]
