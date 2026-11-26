@@ -1059,6 +1059,7 @@ impl NubiClient {
         text: &str,
         mentions: Vec<String>,
         cc: Vec<String>,
+        attachments: Vec<String>,
         mandate_hash_claim: Option<&str>,
     ) -> Result<Value, String> {
         let path = format!(
@@ -1099,9 +1100,14 @@ impl NubiClient {
         to.retain(|n| !copied.contains(n));
         let cc = copied;
 
+        let mut parts = vec![json!({ "kind": "text", "text": text })];
+        for upload_id in &attachments {
+            parts.push(json!({ "kind": "file", "file": { "upload_id": upload_id } }));
+        }
+
         let mut body = json!({
             "message_id": message_id,
-            "parts": [{ "kind": "text", "text": text }],
+            "parts": parts,
             "mentions": to
         });
         let mut metadata = serde_json::Map::new();
@@ -2449,6 +2455,11 @@ fn tools_list_full() -> Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Agent ids who should see this without acting on it, even if mentioned."
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Upload IDs to attach as files (max 10, no duplicates). Get an upload_id by running nubi-upload in the sandbox."
                         }
                     },
                     "required": ["room_id", "text"]
@@ -2958,8 +2969,32 @@ async fn handle_tool_call(
                     .collect(),
                 Some(_) => return Err("cc must be an array of agent ids".to_string()),
             };
+            let attachments: Vec<String> = match args.get("attachments") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(arr)) => {
+                    let ids: Vec<String> = arr
+                        .iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(String::from)
+                                .ok_or("attachments must be an array of upload IDs")
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if ids.len() > 10 {
+                        return Err("attachments: max 10 upload IDs allowed".to_string());
+                    }
+                    let mut seen = std::collections::HashSet::new();
+                    for id in &ids {
+                        if !seen.insert(id) {
+                            return Err(format!("attachments: duplicate upload_id '{}'", id));
+                        }
+                    }
+                    ids
+                }
+                Some(_) => return Err("attachments must be an array of upload IDs".to_string()),
+            };
             client
-                .send_message(room_id, text, mentions, cc, mandate_hash_claim)
+                .send_message(room_id, text, mentions, cc, attachments, mandate_hash_claim)
                 .await
         }
         "nubi_poll" | "nubi_read_history" => {
@@ -4819,12 +4854,101 @@ mod tests {
     async fn a_note_for_nobody_carries_no_metadata() {
         let (client, sent) = spawn_message_sink().await;
         client
-            .send_message("r1", "done", vec![], vec![], None)
+            .send_message("r1", "done", vec![], vec![], vec![], None)
             .await
             .unwrap();
         let body = &sent.lock().await[0];
         assert!(body.get("metadata").is_none(), "{body}");
         assert_eq!(body["mentions"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn attachments_become_file_parts_after_text() {
+        let (client, sent) = spawn_message_sink().await;
+        client
+            .send_message(
+                "r1",
+                "see attached",
+                vec![],
+                vec![],
+                vec!["up_123".into()],
+                None,
+            )
+            .await
+            .unwrap();
+        let parts = &sent.lock().await[0]["parts"];
+        assert_eq!(parts.as_array().unwrap().len(), 2);
+        assert_eq!(parts[0], json!({ "kind": "text", "text": "see attached" }));
+        assert_eq!(
+            parts[1],
+            json!({ "kind": "file", "file": { "upload_id": "up_123" } })
+        );
+    }
+
+    #[tokio::test]
+    async fn ten_attachments_are_allowed() {
+        let (client, sent) = spawn_message_sink().await;
+        let ids: Vec<String> = (1..=10).map(|i| format!("up_{}", i)).collect();
+        client
+            .send_message("r1", "batch", vec![], vec![], ids.clone(), None)
+            .await
+            .unwrap();
+        let parts = &sent.lock().await[0]["parts"];
+        assert_eq!(parts.as_array().unwrap().len(), 11);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                parts[i + 1],
+                json!({ "kind": "file", "file": { "upload_id": id } })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eleven_attachments_are_rejected() {
+        let (client, _sent) = spawn_message_sink().await;
+        let args = json!({
+            "room_id": "r1",
+            "text": "too many",
+            "attachments": ["a","b","c","d","e","f","g","h","i","j","k"]
+        });
+        let config = client.config.clone();
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = handle_tool_call(&client, "nubi_send", &args, &config, &subs, &tx, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max 10"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_attachments_are_rejected() {
+        let (client, _sent) = spawn_message_sink().await;
+        let args = json!({
+            "room_id": "r1",
+            "text": "dupe",
+            "attachments": ["up_1", "up_2", "up_1"]
+        });
+        let config = client.config.clone();
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = handle_tool_call(&client, "nubi_send", &args, &config, &subs, &tx, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn non_string_attachments_are_rejected() {
+        let (client, _sent) = spawn_message_sink().await;
+        let args = json!({
+            "room_id": "r1",
+            "text": "mixed",
+            "attachments": ["up_1", 5, "up_2"]
+        });
+        let config = client.config.clone();
+        let subs: Subscriptions = Arc::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = handle_tool_call(&client, "nubi_send", &args, &config, &subs, &tx, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("array of upload IDs"));
     }
 
     /// Serves one SSE event then hangs up, recording the Last-Event-ID of each
@@ -5472,7 +5596,14 @@ mod tests {
         let (client, _) = stdio_client(&base);
         client.get_mandate().await.unwrap();
         client
-            .send_message("r1", "?", vec!["apple".into()], vec!["pine".into()], None)
+            .send_message(
+                "r1",
+                "?",
+                vec!["apple".into()],
+                vec!["pine".into()],
+                vec![],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(
