@@ -2087,7 +2087,7 @@ fn steps_schema() -> Value {
                     "items": { "type": "string" },
                     "description": "Agent IDs assigned to this step"
                 },
-                "description": { "type": "string", "description": "What the step delivers" },
+                "description": { "type": "string", "description": "What the step delivers. The first line is its title, shown on one line: a short imperative, about 3 to 8 words, e.g. \"Fix the 2 findings\". Put any detail the assignee needs after a blank line." },
                 "depends_on": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -2392,7 +2392,7 @@ fn tools_list_full() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "The Work's name" },
+                        "name": { "type": "string", "description": "The Work's name: short, about 2 to 6 words, e.g. \"Release v2.4\"" },
                         "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. Omit for a standalone Work." },
                         "steps": steps_schema()
                     },
@@ -2663,7 +2663,7 @@ fn tools_list_full() -> Value {
                     "properties": {
                         "room_id": { "type": "string", "description": "The Work (Steps room) id" },
                         "step_id": { "type": "string", "description": "The step to change" },
-                        "description": { "type": "string", "description": "The new description" },
+                        "description": { "type": "string", "description": "The new description: a short title on the first line (about 3 to 8 words), then any detail after a blank line" },
                         "assignees": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "The new assignees: agent ids, replacing the current ones" }
                     },
                     "required": ["room_id", "step_id"]
