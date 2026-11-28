@@ -2182,11 +2182,11 @@ fn tools_list_full() -> Value {
         "tools": [
             {
                 "name": "nubi_list_rooms",
-                "description": "List the rooms you are a member of: DMs, groups, tasks, threads and the rest. For skills use nubi_list_skills, for Work templates nubi_list_work_templates, for docs nubi_list_docs.",
+                "description": "List the rooms you are a member of: DMs, groups, threads and the rest. For skills use nubi_list_skills, for Work templates nubi_list_work_templates, for docs nubi_list_docs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "kind": { "type": "string", "description": "Only rooms of this kind, e.g. dm, group, task, thread, doc, steps, schedule." },
+                        "kind": { "type": "string", "description": "Only rooms of this kind, e.g. dm, group, thread, doc, steps, schedule." },
                         "include_public": { "type": "boolean", "description": "Also list public rooms you are not a member of." }
                     }
                 }
@@ -2388,12 +2388,12 @@ fn tools_list_full() -> Value {
             },
             {
                 "name": "nubi_create_work",
-                "description": "Start a Work: steps with assignees and dependencies that run now. Each assignee is told when their step starts and completes it with nubi_complete_step. With `parent_room_id` the Work is tracked from that thread (a thread in a group or task room); without it the Work is standalone and its messages, notices and evidence live in its own room. One Work per piece of work: if one is already running for it (a PR, a task), change that one with nubi_add_steps, nubi_edit_step or nubi_remove_steps instead of starting another per commit or review round. Returns a `url` field: always share it so people can follow the progress.",
+                "description": "Start a Work: steps with assignees and dependencies that run now. Each assignee is told when their step starts and completes it with nubi_complete_step. With `parent_room_id` the Work is tracked from that thread (a thread in a group room); without it the Work is standalone and its messages, notices and evidence live in its own room. One Work per piece of work: if one is already running for it (a PR, a task), change that one with nubi_add_steps, nubi_edit_step or nubi_remove_steps instead of starting another per commit or review round. Returns a `url` field: always share it so people can follow the progress.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": { "type": "string", "description": "The Work's name" },
-                        "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group or task room. Omit for a standalone Work." },
+                        "parent_room_id": { "type": "string", "description": "Optional. The thread the work happens in (`thread.{room}.{index}`), in a group room. Omit for a standalone Work." },
                         "steps": steps_schema()
                     },
                     "required": ["name", "steps"]
@@ -5243,7 +5243,7 @@ mod tests {
                             { "id": "g1", "name": "general", "kind": { "type": "group" } },
                             { "id": "s1", "name": "Refunds", "kind": { "type": "skill", "status": "published" } },
                             { "id": "s2", "name": "Tone", "kind": { "type": "skill", "status": "draft" } },
-                            { "id": "t1", "name": "task", "kind": { "type": "task", "status": "published" } }
+                            { "id": "g2", "name": "ops", "kind": { "type": "group" } }
                         ]))
                     },
                 ),
